@@ -15,92 +15,118 @@
 {% endblock %}
 
 {% block content %}
+<section class="hero-panel search-hero" aria-labelledby="search-title">
+    <div class="eyebrow">Real-Debrid audiobook search</div>
+    <div class="title-container compact">
+        <h1 id="search-title">Find your next listen.</h1>
+        <p class="page-intro">Search AudioBookBay, review the essentials, then add a book to your Real-Debrid library.</p>
+    </div>
+    <div class="search-container" id="search-container">
+        <form method="post" class="search-form" onsubmit="showLoadingSpinner()">
+            <label class="sr-only" for="query">Book name</label>
+            <input id="query" type="text" name="query" placeholder="Book title, author, or series" class="search-bar" value="{{ query }}" required>
+            <button type="submit" class="search-button">
+                <span class="button-text">Search</span>
+                <span class="button-spinner" id="button-spinner" style="display: none;" aria-hidden="true">
+                    <span class="spinner"></span>
+                </span>
+            </button>
+        </form>
+    </div>
+</section>
 
-<div class="title-container">
-    <h1>Search AudiobookBay</h1>
-</div>
-<div class="search-container" id="search-container">
-<form method="post" class="search-form" onsubmit="showLoadingSpinner()">
-    <input type="text" name="query" placeholder="Enter book name" class="search-bar" value="{{ query }}" required>
-    <button type="submit" class="search-button">
-        <span class="button-text">Search</span>
-        <div class="button-spinner" id="button-spinner" style="display: none;">
-            <div class="spinner"></div>
-        </div>
-    </button>
-</form>
-</div>
-<div class="message-scroller" id="message-scroller">
+<div class="message-scroller" id="message-scroller" role="status" aria-live="polite">
     <p id="scrolling-message"></p>
 </div>
 
-<div class="loading-spinner" id="loading-spinner">
+<div class="loading-spinner" id="loading-spinner" role="status" aria-live="polite">
     <div class="spinner"></div>
     <p>Searching...</p>
 </div>
 
 {% if error %}
-  <p class="error-message">{{ error }}</p>
+  <div class="notice error-message" role="alert">{{ error }}</div>
 {% endif %}
 
 {% if books %}
-<div id="filter-container">
-    <div class="filter-row">
-        <div class="filter-controls">
-            <select id="language-filter">
-                <option value="">All Languages</option>
-            </select>
-            <select id="bitrate-filter">
-                <option value="">All Bitrates</option>
-            </select>
-            <select id="format-filter">
-                <option value="">All Formats</option>
-            </select>
-            <input type="text" id="date-range-filter" placeholder="Select Date Range">
+<section id="filter-container" class="filter-panel" aria-label="Filter search results">
+    <div class="filter-header">
+        <div>
+            <p class="section-kicker">Results</p>
+            <h2>Refine the list</h2>
         </div>
-        <div class="filter-buttons">
-            <button id="filter-button">Filter</button>
+        <div class="filter-buttons top-actions">
+            <button id="filter-button" type="button" class="button-primary">Apply filters</button>
+            <button id="clear-button" type="button" class="button-secondary">Clear</button>
         </div>
     </div>
     <div class="filter-row">
         <div class="filter-controls">
-            <div class="file-size-filter-wrapper">
-                <label>File Size:</label>
-                <div id="file-size-slider"></div>
-            </div>
-        </div>
-        <div class="filter-buttons">
-             <button id="clear-button">Clear</button>
+            <label>
+                <span>Language</span>
+                <select id="language-filter">
+                    <option value="">All languages</option>
+                </select>
+            </label>
+            <label>
+                <span>Bitrate</span>
+                <select id="bitrate-filter">
+                    <option value="">All bitrates</option>
+                </select>
+            </label>
+            <label>
+                <span>Format</span>
+                <select id="format-filter">
+                    <option value="">All formats</option>
+                </select>
+            </label>
+            <label>
+                <span>Posted</span>
+                <input type="text" id="date-range-filter" placeholder="Any date range">
+            </label>
         </div>
     </div>
-</div>
+    <div class="filter-row">
+        <div class="file-size-filter-wrapper">
+            <label for="file-size-slider">File size</label>
+            <div id="file-size-slider"></div>
+        </div>
+    </div>
+</section>
 {% endif %}
 
-<table>
-    <tbody id="results-table-body">
-        {% for book in books %}
-        <tr class="result-row"
-            data-language="{{ book.language }}"
-            data-bitrate="{{ book.bitrate }}"
-            data-format="{{ book.format }}"
-            data-file-size="{{ book.file_size }}"
-            data-post-date="{{ book.post_date }}">
-            <td><img src="{{ book.cover }}" alt="Cover Art" class="cover" width="100"></td>
-            <td><p class="book-title">{{ book.title }}</p>
-                <div class="property-results-container">
-                    <span class="book-language">Language: {{ book.language }}</span>
-                    <span class="book-bitrate">Bitrate: {{ book.bitrate }}</span>
-                    <span class="book-format">Format: {{ book.format }}</span>
-                    <span class="book-file_size">File Size: {{ book.file_size }}</span>
-                    <span class="book-post_date">Posted: {{ book.post_date }}</span>
-                </div>
-            </td>
-            <td>
-                <button onclick='addToRealDebrid({{ book|tojson }})'>Add to Real-Debrid</button>
-            </td>
-        </tr>
-        {% endfor %}
-    </tbody>
-</table>
+{% if books %}
+<section class="results-list" aria-label="Search results">
+    {% for book in books %}
+    <article class="result-row book-card"
+        data-language="{{ book.language }}"
+        data-bitrate="{{ book.bitrate }}"
+        data-format="{{ book.format }}"
+        data-file-size="{{ book.file_size }}"
+        data-post-date="{{ book.post_date }}">
+        <div class="cover-frame">
+            <img src="{{ book.cover }}" alt="Cover art for {{ book.title }}" class="cover" loading="lazy">
+        </div>
+        <div class="book-card-body">
+            <p class="book-title">{{ book.title }}</p>
+            <div class="property-results-container" aria-label="Book metadata">
+                <span class="book-language">{{ book.language }}</span>
+                <span class="book-bitrate">{{ book.bitrate }}</span>
+                <span class="book-format">{{ book.format }}</span>
+                <span class="book-file_size">{{ book.file_size }}</span>
+                <span class="book-post_date">{{ book.post_date }}</span>
+            </div>
+        </div>
+        <div class="book-card-actions">
+            <button type="button" onclick='addToRealDebrid({{ book|tojson }})'>Add to Real-Debrid</button>
+        </div>
+    </article>
+    {% endfor %}
+</section>
+{% elif query and not error %}
+<div class="empty-state">
+    <p>No results found. Try a broader title, author, or series name.</p>
+</div>
+{% endif %}
 
 {% endblock %}

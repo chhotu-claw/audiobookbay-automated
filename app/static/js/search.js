@@ -225,46 +225,28 @@ function clearFilters() {
 
 function showLoadingSpinner() {
   const buttonSpinner = document.getElementById("button-spinner");
-  if(buttonSpinner) buttonSpinner.style.display = "inline-block";
+  const loadingSpinner = document.getElementById("loading-spinner");
+  if (buttonSpinner) buttonSpinner.style.display = "inline-flex";
+  if (loadingSpinner) loadingSpinner.style.display = "flex";
   setTimeout(showScrollingMessages, 5000);
 }
 
 function hideLoadingSpinner() {
   const buttonSpinner = document.getElementById("button-spinner");
-  if(buttonSpinner) buttonSpinner.style.display = "none";
+  const loadingSpinner = document.getElementById("loading-spinner");
+  if (buttonSpinner) buttonSpinner.style.display = "none";
+  if (loadingSpinner) loadingSpinner.style.display = "none";
   hideScrollingMessages();
 }
 
 const messages = [
-  "Searching... This better be worth it!",
-  "Hold on, this takes a while...",
-  "Still searching... Maybe grab a snack?",
-  "Patience, young grasshopper...",
-  "Wow, this is taking a minute!",
-  "Don’t worry, I got this!",
-  "Maybe go for a walk?",
-  "Still thinking... Almost there!",
-  "Finding the best results for you!",
-  "Hang tight! Searching magic happening!",
-  "One moment... while I consult the ancients.",
-  "Beep boop... processing... please wait...",
-  "My hamsters are running on a wheel, almost there!",
-  "Just gathering some pixie dust, be right back!",
-  "Is it lunchtime yet? Oh, searching... right.",
-  "Please remain calm, the search is in progress.",
-  "Warning: Search may cause extreme awesomeness.",
-  "Calculating the optimal route to your results...",
-  "Almost there... just defragmenting my brain.",
-  "Searching... because the internet is a big place!",
-  "Polishing the search results for your viewing pleasure.",
-  "The search is strong with this one.",
-  "Please wait while I summon the search demons.",
-  "Searching in hyperspace... almost there!",
-  "My coffee is kicking in... search commencing!",
-  "Just a few more gigabytes to process...",
-  "Rome wasn't built in a day.",
-  "Don't blame me, the internet is slow today.",
-  "Almost there... just need to find the right key...",
+  "Still searching. AudioBookBay can take a moment.",
+  "Checking the catalogue and keeping this page ready.",
+  "Thanks for waiting — long searches sometimes need a little time.",
+  "Gathering matching audiobook posts.",
+  "Looking through available listings now.",
+  "Search is still in progress.",
+  "Almost there. Results will appear as soon as the search finishes.",
 ];
 let messageIndex = 0;
 let intervalId = null;

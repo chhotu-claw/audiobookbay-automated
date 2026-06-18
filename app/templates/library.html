@@ -7,36 +7,44 @@
 {% endblock %}
 
 {% block content %}
-<div class="title-container">
-    <h1>Real-Debrid Library</h1>
-</div>
+<section class="page-heading" aria-labelledby="library-title">
+    <div class="eyebrow">Your listening shelf</div>
+    <div class="title-container compact">
+        <h1 id="library-title">Real-Debrid Library</h1>
+        <p class="page-intro">Books you have sent to Real-Debrid. Open a title to stream available audio files or sync its latest status.</p>
+    </div>
+</section>
 
 {% if not books %}
-<p>No books have been added yet. Search AudioBookBay and add one to Real-Debrid.</p>
+<div class="empty-state">
+    <h2>No books yet</h2>
+    <p>No books have been added yet. Search AudioBookBay and add one to Real-Debrid.</p>
+    <a class="button-link" href="{{ url_for('search') }}">Search for an audiobook</a>
+</div>
 {% else %}
-<table>
-    <tbody>
+<section class="results-list library-list" aria-label="Library books">
     {% for book in books %}
-        <tr class="result-row">
-            <td><img src="{{ book.cover or url_for('static', filename='images/default_cover.jpg') }}" alt="Cover Art" class="cover" width="100"></td>
-            <td>
+        <article class="result-row book-card library-card">
+            <a class="cover-frame" href="{{ url_for('book_player', book_id=book.id) }}" aria-label="Open {{ book.title }}">
+                <img src="{{ book.cover or url_for('static', filename='images/default_cover.jpg') }}" alt="Cover art for {{ book.title }}" class="cover" loading="lazy">
+            </a>
+            <div class="book-card-body">
                 <p class="book-title"><a href="{{ url_for('book_player', book_id=book.id) }}">{{ book.title }}</a></p>
-                <div class="property-results-container">
+                <div class="property-results-container" aria-label="Library metadata">
                     <span>Status: {{ book.status }}</span>
                     <span>Progress: {{ book.progress }}%</span>
                     {% if book.file_size %}<span>Size: {{ book.file_size }}</span>{% endif %}
-                    {% if book.error %}<span class="error-message">Error: {{ book.error }}</span>{% endif %}
                 </div>
-            </td>
-            <td>
+                {% if book.error %}<p class="error-message">Error: {{ book.error }}</p>{% endif %}
+            </div>
+            <div class="book-card-actions">
                 <a class="button-link" href="{{ url_for('book_player', book_id=book.id) }}">Open Player</a>
-                <form method="post" action="{{ url_for('sync_book_route', book_id=book.id) }}" style="display:inline">
-                    <button type="submit">Sync</button>
+                <form method="post" action="{{ url_for('sync_book_route', book_id=book.id) }}" class="inline-form">
+                    <button type="submit" class="button-secondary">Sync</button>
                 </form>
-            </td>
-        </tr>
+            </div>
+        </article>
     {% endfor %}
-    </tbody>
-</table>
+</section>
 {% endif %}
 {% endblock %}

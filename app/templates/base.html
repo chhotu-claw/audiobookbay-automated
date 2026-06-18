@@ -9,13 +9,25 @@
     {% block extra_js %}{% endblock %}
 </head>
 <body>
-    <div class="navbar">
-        <a href="{{ url_for('search') }}" class="{% if request.endpoint == 'search' %}active{% endif %}">Search</a>
-        <a href="{{ url_for('library') }}" class="{% if request.endpoint in ['library', 'book_player'] %}active{% endif %}">Library</a>
-    </div>
+    <a class="skip-link" href="#main-content">Skip to content</a>
+    <header class="site-header">
+        <nav class="navbar" aria-label="Primary navigation">
+            <a class="brand" href="{{ url_for('search') }}" aria-label="AudiobookBay Real-Debrid home">
+                <span class="brand-mark">AB</span>
+                <span class="brand-copy">
+                    <span class="brand-title">AudiobookBay RD</span>
+                    <span class="brand-subtitle">Quiet listening library</span>
+                </span>
+            </a>
+            <div class="nav-links">
+                <a href="{{ url_for('search') }}" class="nav-link {% if request.endpoint == 'search' %}active{% endif %}">Search</a>
+                <a href="{{ url_for('library') }}" class="nav-link {% if request.endpoint in ['library', 'book_player'] %}active{% endif %}">Library</a>
+            </div>
+        </nav>
+    </header>
 
-    <div class="content">
+    <main class="content" id="main-content">
         {% block content %}{% endblock %}
-    </div>
+    </main>
 </body>
 </html>
