@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+
+{% block title %}{{ book.title }}{% endblock %}
+
+{% block extra_css %}
+<link rel="stylesheet" href="{{ url_for('static', filename='css/search.css') }}">
+{% endblock %}
+
+{% block content %}
+<div class="title-container">
+    <h1>{{ book.title }}</h1>
+</div>
+
+<div class="player-layout">
+    <img src="{{ book.cover or url_for('static', filename='images/default_cover.jpg') }}" alt="Cover Art" class="cover" width="160">
+    <div>
+        <p><strong>Status:</strong> {{ book.status }} ({{ book.progress }}%)</p>
+        {% if book.error %}<p class="error-message"><strong>Error:</strong> {{ book.error }}</p>{% endif %}
+        <p><a href="{{ book.abb_link }}" target="_blank">AudioBookBay details</a></p>
+        <form method="post" action="{{ url_for('sync_book_route', book_id=book.id) }}">
+            <button type="submit">Sync from Real-Debrid</button>
+        </form>
+    </div>
+</div>
+
+<h2>Files</h2>
+{% if not files %}
+<p>No playable files are available yet. Sync after Real-Debrid finishes downloading.</p>
+{% else %}
+    {% for file in files %}
+        <div class="file-card">
+            <p><strong>{{ file.filename }}</strong>{% if file.bytes %} ({{ (file.bytes / 1024 / 1024)|round(2) }} MB){% endif %}</p>
+            {% if file.streamable %}
+                <audio controls preload="none" style="width:100%">
+                    <source src="{{ url_for('stream', file_id=file.id) }}">
+                    Your browser does not support the audio element.
+                </audio>
+                <p><a href="{{ url_for('stream', file_id=file.id) }}">Open stream</a></p>
+            {% else %}
+                <p>This file type is not playable in the browser.</p>
+            {% endif %}
+        </div>
+    {% endfor %}
+{% endif %}
+{% endblock %}

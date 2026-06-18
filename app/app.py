@@ -1,389 +1,520 @@
 import os
 import re
+import ipaddress
+import sqlite3
+import socket
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import quote, quote_plus, urlparse
+
 import requests
-from flask import Flask, request, render_template, jsonify
 from bs4 import BeautifulSoup
-from qbittorrentapi import Client
-from transmission_rpc import Client as transmissionrpc
-from deluge_web_client import DelugeWebClient as delugewebclient
-from deluge_web_client import TorrentOptions as delugetorrentoptions
 from dotenv import load_dotenv
-from urllib.parse import urlparse
+from flask import Flask, abort, g, jsonify, redirect, render_template, request, url_for
+
+load_dotenv()
 
 app = Flask(__name__)
 
-# Load environment variables
-load_dotenv()
-
 ABB_HOSTNAME = os.getenv("ABB_HOSTNAME", "audiobookbay.lu")
-
+ABB_ALLOWED_HOSTNAMES = {
+    host.strip().lower()
+    for host in os.getenv("ABB_ALLOWED_HOSTNAMES", "").split(",")
+    if host.strip()
+}
+ABB_ALLOWED_HOSTNAMES.update(
+    {
+        ABB_HOSTNAME.lower(),
+        "audiobookbay.lu",
+        "audiobookbay.se",
+        "audiobookbay.is",
+        "audiobookbay.fi",
+        "theaudiobookbay.se",
+    }
+)
 PAGE_LIMIT = int(os.getenv("PAGE_LIMIT", 5))
+AUTO_SYNC_LIMIT = int(os.getenv("AUTO_SYNC_LIMIT", 20))
+FLASK_PORT = int(os.getenv("PORT", os.getenv("FLASK_PORT", 5078)))
+DATABASE_PATH = os.getenv("DATABASE_PATH", "data/audiobooks.db")
+REAL_DEBRID_API_TOKEN = os.getenv("REAL_DEBRID_API_TOKEN", "")
+REAL_DEBRID_API_BASE = os.getenv("REAL_DEBRID_API_BASE", "https://api.real-debrid.com/rest/1.0")
+AUDIO_EXTENSIONS = (".mp3", ".m4a", ".m4b", ".aac", ".flac", ".ogg", ".opus", ".wav", ".wma")
 
-DOWNLOAD_CLIENT = os.getenv("DOWNLOAD_CLIENT")
-DL_URL = os.getenv("DL_URL")
-if DL_URL:
-    parsed_url = urlparse(DL_URL)
-    DL_SCHEME = parsed_url.scheme
-    DL_HOST = parsed_url.hostname
-    DL_PORT = parsed_url.port
-else:
-    DL_SCHEME = os.getenv("DL_SCHEME", "http")
-    DL_HOST = os.getenv("DL_HOST")
-    DL_PORT = os.getenv("DL_PORT")
-
-    # Make a DL_URL for Deluge if one was not specified
-    if DL_HOST and DL_PORT:
-        DL_URL = f"{DL_SCHEME}://{DL_HOST}:{DL_PORT}"
-
-DL_USERNAME = os.getenv("DL_USERNAME")
-DL_PASSWORD = os.getenv("DL_PASSWORD")
-DL_CATEGORY = os.getenv("DL_CATEGORY", "Audiobookbay-Audiobooks")
-SAVE_PATH_BASE = os.getenv("SAVE_PATH_BASE")
-
-# Custom Nav Link Variables
-NAV_LINK_NAME = os.getenv("NAV_LINK_NAME")
-NAV_LINK_URL = os.getenv("NAV_LINK_URL")
-
-# Define the port to be used
-FLASK_PORT = int(os.getenv("PORT", 5078))
-
-# Print configuration
 print(f"ABB_HOSTNAME: {ABB_HOSTNAME}")
-print(f"DOWNLOAD_CLIENT: {DOWNLOAD_CLIENT}")
-print(f"DL_HOST: {DL_HOST}")
-print(f"DL_PORT: {DL_PORT}")
-print(f"DL_URL: {DL_URL}")
-print(f"DL_USERNAME: {DL_USERNAME}")
-print(f"DL_CATEGORY: {DL_CATEGORY}")
-print(f"SAVE_PATH_BASE: {SAVE_PATH_BASE}")
-print(f"NAV_LINK_NAME: {NAV_LINK_NAME}")
-print(f"NAV_LINK_URL: {NAV_LINK_URL}")
 print(f"PAGE_LIMIT: {PAGE_LIMIT}")
 print(f"PORT: {FLASK_PORT}")
+print(f"DATABASE_PATH: {DATABASE_PATH}")
+print(f"REAL_DEBRID_API_BASE: {REAL_DEBRID_API_BASE}")
+print(f"REAL_DEBRID_API_TOKEN configured: {bool(REAL_DEBRID_API_TOKEN)}")
 
 
 @app.context_processor
 def inject_nav_link():
-    return {
-        "nav_link_name": os.getenv("NAV_LINK_NAME"),
-        "nav_link_url": os.getenv("NAV_LINK_URL"),
-    }
+    return {}
 
 
-def is_url_valid(url):
-    """
-    Checks if URL is valid and returns a 200 status code. Primarily used to check if cover images are accessible.
+def now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-    Args:
-        url (str): The URL to check.
-    """
+
+def get_db_path():
+    return app.config.get("DATABASE_PATH", DATABASE_PATH)
+
+
+def get_db():
+    if "db" not in g:
+        db_path = Path(get_db_path())
+        if db_path.parent and str(db_path.parent) != ".":
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+        g.db = sqlite3.connect(db_path)
+        g.db.row_factory = sqlite3.Row
+    return g.db
+
+
+@app.teardown_appcontext
+def close_db(exc=None):
+    db = g.pop("db", None)
+    if db is not None:
+        db.close()
+
+
+def init_db():
+    db = get_db()
+    db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS books (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            abb_link TEXT NOT NULL UNIQUE,
+            cover TEXT,
+            language TEXT,
+            format TEXT,
+            bitrate TEXT,
+            file_size TEXT,
+            post_date TEXT,
+            magnet TEXT,
+            rd_id TEXT,
+            status TEXT NOT NULL DEFAULT 'queued',
+            progress INTEGER NOT NULL DEFAULT 0,
+            error TEXT,
+            added_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            book_id INTEGER NOT NULL,
+            rd_file_id INTEGER,
+            rd_link_index INTEGER,
+            rd_link TEXT,
+            filename TEXT NOT NULL,
+            bytes INTEGER,
+            selected INTEGER NOT NULL DEFAULT 1,
+            streamable INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(book_id, rd_link_index),
+            FOREIGN KEY(book_id) REFERENCES books(id) ON DELETE CASCADE
+        );
+        """
+    )
+    db.commit()
+
+
+with app.app_context():
+    init_db()
+
+
+class RealDebridError(RuntimeError):
+    pass
+
+
+class RealDebridClient:
+    def __init__(self, token=None, base_url=None, session=None):
+        self.token = token if token is not None else os.getenv("REAL_DEBRID_API_TOKEN", REAL_DEBRID_API_TOKEN)
+        self.base_url = (base_url or os.getenv("REAL_DEBRID_API_BASE", REAL_DEBRID_API_BASE)).rstrip("/")
+        self.session = session or requests.Session()
+        if not self.token:
+            raise RealDebridError("REAL_DEBRID_API_TOKEN is not configured")
+
+    def _request(self, method, path, **kwargs):
+        headers = kwargs.pop("headers", {})
+        headers["Authorization"] = f"Bearer {self.token}"
+        response = self.session.request(method, f"{self.base_url}{path}", headers=headers, timeout=30, **kwargs)
+        if response.status_code >= 400:
+            try:
+                detail = response.json()
+            except ValueError:
+                detail = response.text
+            raise RealDebridError(f"Real-Debrid API error {response.status_code}: {detail}")
+        if response.status_code == 204 or not response.content:
+            return {}
+        return response.json()
+
+    def add_magnet(self, magnet):
+        return self._request("POST", "/torrents/addMagnet", data={"magnet": magnet})
+
+    def select_all_files(self, torrent_id):
+        return self._request("POST", f"/torrents/selectFiles/{torrent_id}", data={"files": "all"})
+
+    def torrent_info(self, torrent_id):
+        return self._request("GET", f"/torrents/info/{torrent_id}")
+
+    def unrestrict_link(self, link):
+        return self._request("POST", "/unrestrict/link", data={"link": link})
+
+
+def rd_client():
+    factory = app.config.get("RD_CLIENT_FACTORY")
+    if factory:
+        return factory()
+    return RealDebridClient()
+
+
+def _normalized_hostname(parsed):
     try:
-        # Use a HEAD request with a short timeout and stream parameter
-        response = requests.head(url, timeout=3, allow_redirects=True, stream=True)
-        return response.status_code == 200
-    except requests.exceptions.RequestException:
+        return (parsed.hostname or "").rstrip(".").lower()
+    except ValueError:
+        return ""
+
+
+def _is_unsafe_host(hostname, resolve=False):
+    host = (hostname or "").rstrip(".").lower()
+    if not host or host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+        return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_unspecified or ip.is_reserved or ip.is_multicast
+    except ValueError:
+        pass
+    if resolve:
+        try:
+            for result in socket.getaddrinfo(host, None):
+                ip = ipaddress.ip_address(result[4][0])
+                if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_unspecified or ip.is_reserved or ip.is_multicast:
+                    return True
+        except (OSError, ValueError):
+            return False
+    return False
+
+
+def is_safe_http_url(url, allowed_hosts=None, resolve=False):
+    try:
+        parsed = urlparse(url)
+    except Exception:
         return False
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return False
+    hostname = _normalized_hostname(parsed)
+    if _is_unsafe_host(hostname, resolve=resolve):
+        return False
+    if allowed_hosts is not None and hostname not in {h.lower() for h in allowed_hosts}:
+        return False
+    return True
 
 
-# Helper function to search AudiobookBay
+def is_safe_abb_details_url(url):
+    return is_safe_http_url(url, allowed_hosts=ABB_ALLOWED_HOSTNAMES)
+
+
+def is_safe_stream_redirect_url(url):
+    return is_safe_http_url(url, resolve=True)
+
+
+def sanitized_error(error):
+    if isinstance(error, RealDebridError):
+        return "Real-Debrid request failed"
+    return "Request failed"
+
+
 def search_audiobookbay(query, max_pages=PAGE_LIMIT):
-    """
-    Searches AudiobookBay for a given query and scrapes the results.
-
-    Args:
-        query (str): The search term.
-        max_pages (int): The maximum number of pages to scrape.
-
-    Returns:
-        list: A list of dictionaries, where each dictionary represents a book
-              and contains its details.
-    """
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
-    }
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     results = []
-
-    print(f"Searching for '{query}' on https://{ABB_HOSTNAME}...")
-
     for page in range(1, max_pages + 1):
-        url = f"https://{ABB_HOSTNAME}/page/{page}/?s={query.lower().replace(' ', '+')}"
+        url = f"https://{ABB_HOSTNAME}/page/{page}/?s={quote_plus(query.lower())}"
         try:
             response = requests.get(url, headers=headers, timeout=15)
-            # Raise an exception for bad status codes (4xx or 5xx)
             response.raise_for_status()
         except requests.exceptions.RequestException as e:
-            print(f"[ERROR] Failed to fetch page {page}. Reason: {e}")
+            print(f"[ERROR] Failed to fetch page {page}: {e}")
             break
-
         soup = BeautifulSoup(response.text, "html.parser")
         posts = soup.select(".post")
-
-        # If no posts are found on the page, stop paginating
         if not posts:
-            print(f"No more results found on page {page}.")
             break
-
-        print(f"Processing {len(posts)} posts on page {page}...")
-
         for post in posts:
             try:
                 title_element = post.select_one(".postTitle > h2 > a")
                 if not title_element:
-                    continue  # Skip post if title is not found
-
+                    continue
                 title = title_element.text.strip()
-                link = f"https://{ABB_HOSTNAME}{title_element['href']}"
-
-                # Check if the cover URL is valid, otherwise use the default
-                cover_url = (
-                    post.select_one("img")["src"] if post.select_one("img") else None
-                )
-                if cover_url and is_url_valid(cover_url):
-                    cover = cover_url
-                else:
-                    cover = "/static/images/default_cover.jpg"
-
+                href = title_element.get("href", "")
+                link = href if href.startswith("http") else f"https://{ABB_HOSTNAME}{href}"
+                cover_url = post.select_one("img")["src"] if post.select_one("img") else None
+                cover = cover_url or "/static/images/default_cover.jpg"
                 post_info = post.select_one(".postInfo")
-                post_info_text = (
-                    post_info.get_text(separator=" ", strip=True) if post_info else ""
-                )
-
-                language_match = re.search(
-                    r"Language:\s*(.*?)(?:\s*Keywords:|$)", post_info_text, re.DOTALL
-                )
+                post_info_text = post_info.get_text(separator=" ", strip=True) if post_info else ""
+                language_match = re.search(r"Language:\s*(.*?)(?:\s*Keywords:|$)", post_info_text, re.DOTALL)
                 language = language_match.group(1).strip() if language_match else "N/A"
-
-                details_paragraph = post.select_one(
-                    ".postContent p[style*='text-align:center']"
-                )
-
+                details_paragraph = post.select_one(".postContent p[style*='text-align:center']")
                 post_date, book_format, bitrate, file_size = "N/A", "N/A", "N/A", "N/A"
-
                 if details_paragraph:
                     details_html = str(details_paragraph)
-
                     post_date_match = re.search(r"Posted:\s*([^<]+)", details_html)
-                    post_date = (
-                        post_date_match.group(1).strip() if post_date_match else "N/A"
-                    )
-
-                    format_match = re.search(
-                        r"Format:\s*<span[^>]*>([^<]+)</span>", details_html
-                    )
-                    book_format = (
-                        format_match.group(1).strip() if format_match else "N/A"
-                    )
-
-                    bitrate_match = re.search(
-                        r"Bitrate:\s*<span[^>]*>([^<]+)</span>", details_html
-                    )
+                    post_date = post_date_match.group(1).strip() if post_date_match else "N/A"
+                    format_match = re.search(r"Format:\s*<span[^>]*>([^<]+)</span>", details_html)
+                    book_format = format_match.group(1).strip() if format_match else "N/A"
+                    bitrate_match = re.search(r"Bitrate:\s*<span[^>]*>([^<]+)</span>", details_html)
                     bitrate = bitrate_match.group(1).strip() if bitrate_match else "N/A"
-
-                    file_size_match = re.search(
-                        r"File Size:\s*<span[^>]*>([^<]+)</span>\s*([^<]+)",
-                        details_html,
-                    )
+                    file_size_match = re.search(r"File Size:\s*<span[^>]*>([^<]+)</span>\s*([^<]+)", details_html)
                     if file_size_match:
                         file_size = f"{file_size_match.group(1).strip()} {file_size_match.group(2).strip()}"
-
-                results.append(
-                    {
-                        "title": title,
-                        "link": link,
-                        "cover": cover,
-                        "language": language,
-                        "post_date": post_date,
-                        "format": book_format,
-                        "bitrate": bitrate,
-                        "file_size": file_size,
-                    }
-                )
+                results.append({"title": title, "link": link, "cover": cover, "language": language, "post_date": post_date, "format": book_format, "bitrate": bitrate, "file_size": file_size})
             except Exception as e:
-                print(f"[ERROR] Could not process a post. Details: {e}")
-                continue
+                print(f"[ERROR] Could not process a post: {e}")
     return results
 
 
-# Helper function to extract magnet link from details page
 def extract_magnet_link(details_url):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
-    }
+    if not is_safe_abb_details_url(details_url):
+        raise ValueError("Invalid AudioBookBay details URL")
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     try:
-        response = requests.get(details_url, headers=headers)
+        response = requests.get(details_url, headers=headers, timeout=15, allow_redirects=False)
         if response.status_code != 200:
-            print(
-                f"[ERROR] Failed to fetch details page. Status Code: {response.status_code}"
-            )
             return None
-
         soup = BeautifulSoup(response.text, "html.parser")
-
-        # Extract Info Hash
+        magnet = soup.select_one('a[href^="magnet:"]')
+        if magnet:
+            return magnet["href"]
         info_hash_row = soup.find("td", string=re.compile(r"Info Hash", re.IGNORECASE))
         if not info_hash_row:
-            print("[ERROR] Info Hash not found on the page.")
             return None
         info_hash = info_hash_row.find_next_sibling("td").text.strip()
-
-        # Extract Trackers
-        tracker_rows = soup.find_all(
-            "td", string=re.compile(r"udp://|http://", re.IGNORECASE)
-        )
-        trackers = [row.text.strip() for row in tracker_rows]
-
-        if not trackers:
-            print("[WARNING] No trackers found on the page. Using default trackers.")
-            trackers = [
-                "udp://tracker.openbittorrent.com:80",
-                "udp://opentor.org:2710",
-                "udp://tracker.ccc.de:80",
-                "udp://tracker.blackunicorn.xyz:6969",
-                "udp://tracker.coppersurfer.tk:6969",
-                "udp://tracker.leechers-paradise.org:6969",
-            ]
-
-        # Construct the magnet link
-        trackers_query = "&".join(
-            f"tr={requests.utils.quote(tracker)}" for tracker in trackers
-        )
-        magnet_link = f"magnet:?xt=urn:btih:{info_hash}&{trackers_query}"
-
-        print(f"[DEBUG] Generated Magnet Link: {magnet_link}")
-        return magnet_link
-
-    except Exception as e:
+        tracker_rows = soup.find_all("td", string=re.compile(r"udp://|http://", re.IGNORECASE))
+        trackers = [row.text.strip() for row in tracker_rows] or ["udp://tracker.openbittorrent.com:80", "udp://opentor.org:2710"]
+        trackers_query = "&".join(f"tr={quote(tracker)}" for tracker in trackers)
+        return f"magnet:?xt=urn:btih:{info_hash}&{trackers_query}"
+    except requests.exceptions.RequestException as e:
         print(f"[ERROR] Failed to extract magnet link: {e}")
         return None
 
 
-# Helper function to sanitize titles
-def sanitize_title(title):
-    return re.sub(r'[<>:"/\\|?*]', "", title).strip()
+def is_streamable(filename):
+    return filename.lower().endswith(AUDIO_EXTENSIONS)
 
 
-# Endpoint for search page
+def row_to_dict(row):
+    return dict(row) if row else None
+
+
+def get_book(book_id):
+    return get_db().execute("SELECT * FROM books WHERE id = ?", (book_id,)).fetchone()
+
+
+def upsert_files(book_id, info):
+    links = info.get("links") or []
+    files = [f for f in (info.get("files") or []) if f.get("selected", 0)] or info.get("files") or []
+    ts = now_iso()
+    db = get_db()
+    for idx, link in enumerate(links):
+        meta = files[idx] if idx < len(files) else {}
+        filename = meta.get("path") or meta.get("filename") or f"File {idx + 1}"
+        filename = filename.split("/")[-1] or filename
+        db.execute(
+            """
+            INSERT INTO files (book_id, rd_file_id, rd_link_index, rd_link, filename, bytes, selected, streamable, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(book_id, rd_link_index) DO UPDATE SET
+                rd_file_id=excluded.rd_file_id, rd_link=excluded.rd_link, filename=excluded.filename,
+                bytes=excluded.bytes, selected=excluded.selected, streamable=excluded.streamable, updated_at=excluded.updated_at
+            """,
+            (book_id, meta.get("id"), idx, link, filename, meta.get("bytes"), 1 if meta.get("selected", 1) else 0, 1 if is_streamable(filename) else 0, ts, ts),
+        )
+    db.commit()
+
+
+def sync_book(book_id):
+    book = get_book(book_id)
+    if not book:
+        abort(404)
+    if not book["rd_id"]:
+        return book
+    try:
+        info = rd_client().torrent_info(book["rd_id"])
+        status = info.get("status") or book["status"]
+        progress = int(info.get("progress") or 0)
+        ts = now_iso()
+        get_db().execute("UPDATE books SET status = ?, progress = ?, error = NULL, updated_at = ? WHERE id = ?", (status, progress, ts, book_id))
+        get_db().commit()
+        if links := info.get("links"):
+            upsert_files(book_id, info)
+        return get_book(book_id)
+    except Exception as e:
+        get_db().execute("UPDATE books SET error = ?, updated_at = ? WHERE id = ?", (sanitized_error(e), now_iso(), book_id))
+        get_db().commit()
+        raise
+
+
+def book_needs_auto_sync(book):
+    if not book or not book["rd_id"]:
+        return False
+    if book["status"] != "downloaded":
+        return True
+    file_count = get_db().execute("SELECT COUNT(*) AS count FROM files WHERE book_id = ?", (book["id"],)).fetchone()["count"]
+    return file_count == 0
+
+
+def maybe_auto_sync_book(book_id):
+    book = get_book(book_id)
+    if not book_needs_auto_sync(book):
+        return
+    try:
+        sync_book(book_id)
+    except Exception as e:
+        print(f"[WARNING] Auto-sync failed for book {book_id}: {e}")
+
+
+def auto_sync_books(limit=AUTO_SYNC_LIMIT):
+    candidates = get_db().execute(
+        """
+        SELECT books.* FROM books
+        LEFT JOIN files ON files.book_id = books.id
+        WHERE books.rd_id IS NOT NULL
+        GROUP BY books.id
+        HAVING books.status != 'downloaded' OR COUNT(files.id) = 0
+        ORDER BY books.updated_at ASC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    for book in candidates:
+        try:
+            sync_book(book["id"])
+        except Exception as e:
+            print(f"[WARNING] Auto-sync failed for book {book['id']}: {e}")
+
+
 @app.route("/", methods=["GET", "POST"])
 def search():
     books = []
     query = ""
     try:
-        if request.method == "POST":  # Form submitted
+        if request.method == "POST":
             query = request.form["query"]
-            if query:  # Only search if the query is not empty
+            if query:
                 books = search_audiobookbay(query)
         return render_template("search.html", books=books, query=query)
     except Exception as e:
-        print(f"[ERROR] Failed to search: {e}")
-        return render_template(
-            "search.html", books=books, error=f"Failed to search. {str(e)}", query=query
-        )
+        return render_template("search.html", books=books, error=f"Failed to search. {str(e)}", query=query)
 
 
-# Endpoint to send magnet link to qBittorrent
-@app.route("/send", methods=["POST"])
-def send():
-    data = request.json
+@app.route("/api/add", methods=["POST"])
+def api_add():
+    data = request.get_json(silent=True) or {}
     details_url = data.get("link")
     title = data.get("title")
     if not details_url or not title:
-        return jsonify({"message": "Invalid request"}), 400
-
+        return jsonify({"message": "Missing title or link"}), 400
+    if not is_safe_abb_details_url(details_url):
+        return jsonify({"message": "Invalid AudioBookBay details URL"}), 400
+    db = get_db()
+    existing = db.execute("SELECT * FROM books WHERE abb_link = ?", (details_url,)).fetchone()
+    if existing:
+        if existing["rd_id"] and existing["status"] == "error":
+            try:
+                sync_book(existing["id"])
+            except Exception as e:
+                print(f"[WARNING] Existing errored book sync failed for {existing['id']}: {e}")
+        return jsonify({"message": "Already in library", "book_id": existing["id"], "library_url": url_for("book_player", book_id=existing["id"])})
     try:
-        magnet_link = extract_magnet_link(details_url)
-        if not magnet_link:
-            return jsonify({"message": "Failed to extract magnet link"}), 500
-
-        save_path = f"{SAVE_PATH_BASE}/{sanitize_title(title)}"
-
-        if DOWNLOAD_CLIENT == "qbittorrent":
-            qb = Client(
-                host=DL_HOST, port=DL_PORT, username=DL_USERNAME, password=DL_PASSWORD
-            )
-            qb.auth_log_in()
-            qb.torrents_add(urls=magnet_link, save_path=save_path, category=DL_CATEGORY)
-        elif DOWNLOAD_CLIENT == "transmission":
-            transmission = transmissionrpc(
-                host=DL_HOST,
-                port=DL_PORT,
-                protocol=DL_SCHEME,
-                username=DL_USERNAME,
-                password=DL_PASSWORD,
-            )
-            transmission.add_torrent(magnet_link, download_dir=save_path)
-        elif DOWNLOAD_CLIENT == "delugeweb":
-            delugeweb = delugewebclient(url=DL_URL, password=DL_PASSWORD)
-            delugeweb.login()
-            torrent_options = delugetorrentoptions(
-                download_location=save_path, label=DL_CATEGORY
-            )
-            delugeweb.add_torrent_magnet(magnet_link, torrent_options=torrent_options)
-        else:
-            return jsonify({"message": "Unsupported download client"}), 400
-
-        return jsonify(
-            {
-                "message": "Download added successfully! This may take some time, the download will show in Audiobookshelf when completed."
-            }
-        )
+        magnet = extract_magnet_link(details_url)
+    except ValueError:
+        return jsonify({"message": "Invalid AudioBookBay details URL"}), 400
+    if not magnet:
+        return jsonify({"message": "Failed to extract magnet link"}), 500
+    ts = now_iso()
+    cur = db.execute(
+        """
+        INSERT INTO books (title, abb_link, cover, language, format, bitrate, file_size, post_date, magnet, status, progress, added_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'adding', 0, ?, ?)
+        """,
+        (title, details_url, data.get("cover"), data.get("language"), data.get("format"), data.get("bitrate"), data.get("file_size"), data.get("post_date"), magnet, ts, ts),
+    )
+    book_id = cur.lastrowid
+    db.commit()
+    try:
+        rd = rd_client()
+        added = rd.add_magnet(magnet)
+        rd_id = added.get("id")
+        if not rd_id:
+            raise RealDebridError("Real-Debrid did not return a torrent id")
+        db.execute("UPDATE books SET rd_id = ?, status = 'queued', updated_at = ? WHERE id = ?", (rd_id, now_iso(), book_id))
+        db.commit()
+        rd.select_all_files(rd_id)
+        try:
+            sync_book(book_id)
+        except Exception as e:
+            print(f"[WARNING] Initial sync failed for book {book_id}: {e}")
+        return jsonify({"message": "Added to Real-Debrid", "book_id": book_id, "library_url": url_for("book_player", book_id=book_id)})
     except Exception as e:
-        return jsonify({"message": str(e)}), 500
+        safe_message = sanitized_error(e)
+        db.execute("UPDATE books SET status = 'error', error = ?, updated_at = ? WHERE id = ?", (safe_message, now_iso(), book_id))
+        db.commit()
+        return jsonify({"message": safe_message, "book_id": book_id}), 502
+
+
+@app.route("/library")
+def library():
+    auto_sync_books()
+    books = get_db().execute("SELECT * FROM books ORDER BY added_at DESC").fetchall()
+    return render_template("library.html", books=books)
+
+
+@app.route("/library/<int:book_id>/sync", methods=["POST"])
+def sync_book_route(book_id):
+    try:
+        sync_book(book_id)
+        return redirect(url_for("book_player", book_id=book_id))
+    except Exception as e:
+        print(f"[WARNING] Manual sync failed for book {book_id}: {e}")
+        return jsonify({"message": "Sync failed"}), 502
+
+
+@app.route("/book/<int:book_id>")
+def book_player(book_id):
+    book = get_book(book_id)
+    if not book:
+        abort(404)
+    maybe_auto_sync_book(book_id)
+    book = get_book(book_id)
+    files = get_db().execute("SELECT * FROM files WHERE book_id = ? ORDER BY rd_link_index", (book_id,)).fetchall()
+    return render_template("player.html", book=book, files=files)
+
+
+@app.route("/stream/<int:file_id>")
+def stream(file_id):
+    file_row = get_db().execute("SELECT files.*, books.title AS book_title FROM files JOIN books ON books.id = files.book_id WHERE files.id = ?", (file_id,)).fetchone()
+    if not file_row:
+        abort(404)
+    if not file_row["rd_link"]:
+        abort(404, "No Real-Debrid link available yet; sync the book first.")
+    try:
+        unrestricted = rd_client().unrestrict_link(file_row["rd_link"])
+        direct = unrestricted.get("download") or unrestricted.get("link")
+        if not direct:
+            raise RealDebridError("Real-Debrid did not return a playable direct link")
+        if not is_safe_stream_redirect_url(direct):
+            raise RealDebridError("Real-Debrid returned an unsafe stream URL")
+        return redirect(direct, code=302)
+    except Exception as e:
+        print(f"[WARNING] Stream failed for file {file_id}: {e}")
+        abort(502, sanitized_error(e))
 
 
 @app.route("/status")
 def status():
-    try:
-        if DOWNLOAD_CLIENT == "transmission":
-            transmission = transmissionrpc(
-                host=DL_HOST, port=DL_PORT, username=DL_USERNAME, password=DL_PASSWORD
-            )
-            torrents = transmission.get_torrents()
-            torrent_list = [
-                {
-                    "name": torrent.name,
-                    "progress": round(torrent.progress, 2),
-                    "state": torrent.status,
-                    "size": f"{torrent.total_size / (1024 * 1024):.2f} MB",
-                }
-                for torrent in torrents
-            ]
-            return render_template("status.html", torrents=torrent_list)
-        elif DOWNLOAD_CLIENT == "qbittorrent":
-            qb = Client(
-                host=DL_HOST, port=DL_PORT, username=DL_USERNAME, password=DL_PASSWORD
-            )
-            qb.auth_log_in()
-            torrents = qb.torrents_info(category=DL_CATEGORY)
-            torrent_list = [
-                {
-                    "name": torrent.name,
-                    "progress": round(torrent.progress * 100, 2),
-                    "state": torrent.state,
-                    "size": f"{torrent.total_size / (1024 * 1024):.2f} MB",
-                }
-                for torrent in torrents
-            ]
-        elif DOWNLOAD_CLIENT == "delugeweb":
-            delugeweb = delugewebclient(url=DL_URL, password=DL_PASSWORD)
-            delugeweb.login()
-            torrents = delugeweb.get_torrents_status(
-                filter_dict={"label": DL_CATEGORY},
-                keys=["name", "state", "progress", "total_size"],
-            )
-            torrent_list = [
-                {
-                    "name": torrent["name"],
-                    "progress": round(torrent["progress"], 2),
-                    "state": torrent["state"],
-                    "size": f"{torrent['total_size'] / (1024 * 1024):.2f} MB",
-                }
-                for k, torrent in torrents.result.items()
-            ]
-        else:
-            return jsonify({"message": "Unsupported download client"}), 400
-        return render_template("status.html", torrents=torrent_list)
-    except Exception as e:
-        return jsonify({"message": f"Failed to fetch torrent status: {e}"}), 500
+    return redirect(url_for("library"))
 
 
 if __name__ == "__main__":

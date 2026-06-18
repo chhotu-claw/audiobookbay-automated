@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+
+{% block title %}Library{% endblock %}
+
+{% block extra_css %}
+<link rel="stylesheet" href="{{ url_for('static', filename='css/search.css') }}">
+{% endblock %}
+
+{% block content %}
+<div class="title-container">
+    <h1>Real-Debrid Library</h1>
+</div>
+
+{% if not books %}
+<p>No books have been added yet. Search AudioBookBay and add one to Real-Debrid.</p>
+{% else %}
+<table>
+    <tbody>
+    {% for book in books %}
+        <tr class="result-row">
+            <td><img src="{{ book.cover or url_for('static', filename='images/default_cover.jpg') }}" alt="Cover Art" class="cover" width="100"></td>
+            <td>
+                <p class="book-title"><a href="{{ url_for('book_player', book_id=book.id) }}">{{ book.title }}</a></p>
+                <div class="property-results-container">
+                    <span>Status: {{ book.status }}</span>
+                    <span>Progress: {{ book.progress }}%</span>
+                    {% if book.file_size %}<span>Size: {{ book.file_size }}</span>{% endif %}
+                    {% if book.error %}<span class="error-message">Error: {{ book.error }}</span>{% endif %}
+                </div>
+            </td>
+            <td>
+                <a class="button-link" href="{{ url_for('book_player', book_id=book.id) }}">Open Player</a>
+                <form method="post" action="{{ url_for('sync_book_route', book_id=book.id) }}" style="display:inline">
+                    <button type="submit">Sync</button>
+                </form>
+            </td>
+        </tr>
+    {% endfor %}
+    </tbody>
+</table>
+{% endif %}
+{% endblock %}

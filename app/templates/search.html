@@ -96,8 +96,7 @@
                 </div>
             </td>
             <td>
-                <button onclick="window.open('{{ book.link }}', '_blank')">Details</button>
-                <button onclick="sendToQB('{{ book.link|escape }}', '{{ book.title|escape }}')">Download to Server</button>
+                <button onclick='addToRealDebrid({{ book|tojson }})'>Add to Real-Debrid</button>
             </td>
         </tr>
         {% endfor %}

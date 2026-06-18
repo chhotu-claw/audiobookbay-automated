@@ -71,6 +71,44 @@ h1 {
 }
 
 
+.button-link,
+button {
+    background: #ffcc00;
+    color: #2d1240;
+    border: none;
+    border-radius: 6px;
+    padding: 8px 12px;
+    font-weight: bold;
+    cursor: pointer;
+    text-decoration: none;
+    display: inline-block;
+    margin: 4px;
+}
+
+.player-layout,
+.file-card {
+    background: rgba(0, 0, 0, 0.25);
+    border-radius: 10px;
+    padding: 15px;
+    margin: 12px auto;
+    max-width: 900px;
+}
+
+.player-layout {
+    display: flex;
+    gap: 20px;
+    align-items: flex-start;
+}
+
+.file-card audio {
+    margin-top: 8px;
+}
+
+.error-message {
+    color: #ffd1d1;
+    font-weight: bold;
+}
+
 @media (max-width: 500px) {
 h1 {
     font-size: 2rem;

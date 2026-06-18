@@ -1,20 +1,18 @@
-version: '3.8'
-
 services:
-  audiobookbay-automated:
-    image: ghcr.io/jamesry96/audiobookbay-automated:latest
+  audiobookbay-rd:
+    build: .
+    image: audiobookbay-automated-rd:latest
     ports:
       - "5078:5078"
-    container_name: audiobookbay-automated
+    container_name: audiobookbay-automated-rd
     environment:
-      - DOWNLOAD_CLIENT=${DOWNLOAD_CLIENT}
-      - DL_HOST=${DL_HOST}
-      - DL_PORT=${DL_PORT}
-      - DL_USERNAME=${DL_USERNAME}
-      - DL_PASSWORD=${DL_PASSWORD}
-      - DL_CATEGORY=${DL_CATEGORY}
-      - SAVE_PATH_BASE=${SAVE_PATH_BASE}
-      - NAV_LINK_NAME=${NAV_LINK_NAME}
-      - NAV_LINK_URL=${NAV_LINK_URL}
+      - REAL_DEBRID_API_TOKEN=${REAL_DEBRID_API_TOKEN:-}
+      - ABB_HOSTNAME=${ABB_HOSTNAME:-audiobookbay.lu}
+      - PAGE_LIMIT=${PAGE_LIMIT:-5}
+      - DATABASE_PATH=/data/audiobooks.db
+      - FLASK_PORT=5078
+    volumes:
+      - ./data:/data
     env_file:
-      - .env
+      - path: .env
+        required: false

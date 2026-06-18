@@ -291,15 +291,21 @@ function hideScrollingMessages() {
   if(messageScroller) messageScroller.style.display = "none";
 }
 
-function sendToQB(link, title) {
-  fetch("/send", {
+function addToRealDebrid(book) {
+  fetch("/api/add", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ link: link, title: title }),
+    body: JSON.stringify(book),
   })
-    .then((response) => response.json())
+    .then(async (response) => {
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.message || "Failed to add book");
+      return data;
+    })
     .then((data) => {
       alert(data.message);
-      hideLoadingSpinner();
-    });
+      if (data.library_url) window.location.href = data.library_url;
+    })
+    .catch((error) => alert(error.message))
+    .finally(hideLoadingSpinner);
 }
