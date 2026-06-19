@@ -44,6 +44,10 @@ FLASK_PORT = int(os.getenv("PORT", os.getenv("FLASK_PORT", 5078)))
 DATABASE_PATH = os.getenv("DATABASE_PATH", "data/audiobooks.db")
 REAL_DEBRID_API_TOKEN = os.getenv("REAL_DEBRID_API_TOKEN", "")
 REAL_DEBRID_API_BASE = os.getenv("REAL_DEBRID_API_BASE", "https://api.real-debrid.com/rest/1.0")
+AUDIOBOOKSHELF_URL = os.getenv("AUDIOBOOKSHELF_URL", "").rstrip("/")
+AUDIOBOOKSHELF_API_TOKEN = os.getenv("AUDIOBOOKSHELF_API_TOKEN", "")
+AUDIOBOOKSHELF_LIBRARY_ID = os.getenv("AUDIOBOOKSHELF_LIBRARY_ID", "")
+AUDIOBOOKSHELF_IMPORT_DIR = os.getenv("AUDIOBOOKSHELF_IMPORT_DIR", "")
 AUDIO_EXTENSIONS = (".mp3", ".m4a", ".m4b", ".aac", ".flac", ".ogg", ".opus", ".wav", ".wma")
 ZIP_EXTENSIONS = (".zip",)
 ARCHIVE_EXTENSIONS = (".zip", ".rar", ".7z")
@@ -56,6 +60,8 @@ print(f"PORT: {FLASK_PORT}")
 print(f"DATABASE_PATH: {DATABASE_PATH}")
 print(f"REAL_DEBRID_API_BASE: {REAL_DEBRID_API_BASE}")
 print(f"REAL_DEBRID_API_TOKEN configured: {bool(REAL_DEBRID_API_TOKEN)}")
+print(f"AUDIOBOOKSHELF_URL configured: {bool(AUDIOBOOKSHELF_URL)}")
+print(f"AUDIOBOOKSHELF_API_TOKEN configured: {bool(AUDIOBOOKSHELF_API_TOKEN)}")
 
 
 @app.context_processor
@@ -181,6 +187,67 @@ def rd_client():
     return RealDebridClient()
 
 
+class AudiobookshelfError(RuntimeError):
+    pass
+
+
+class AudiobookshelfClient:
+    def __init__(self, base_url=None, token=None, session=None):
+        self.base_url = (base_url if base_url is not None else app.config.get("AUDIOBOOKSHELF_URL", AUDIOBOOKSHELF_URL)).rstrip("/")
+        self.token = token if token is not None else app.config.get("AUDIOBOOKSHELF_API_TOKEN", AUDIOBOOKSHELF_API_TOKEN)
+        self.session = session or requests.Session()
+        if not self.base_url or not self.token:
+            raise AudiobookshelfError("Audiobookshelf is not configured")
+
+    def _request(self, method, path, **kwargs):
+        headers = kwargs.pop("headers", {})
+        headers["Authorization"] = f"Bearer {self.token}"
+        try:
+            response = self.session.request(method, f"{self.base_url}{path}", headers=headers, timeout=30, **kwargs)
+        except requests.exceptions.RequestException as exc:
+            raise AudiobookshelfError("Audiobookshelf request failed") from exc
+        if response.status_code in {401, 403}:
+            raise AudiobookshelfError("Audiobookshelf authorization failed")
+        if response.status_code >= 400:
+            raise AudiobookshelfError(f"Audiobookshelf API error {response.status_code}")
+        if response.status_code == 204 or not response.content:
+            return {}
+        try:
+            return response.json()
+        except ValueError:
+            return {"raw": response.text}
+
+    def healthcheck(self):
+        return self._request("GET", "/healthcheck")
+
+    def library(self, library_id):
+        return self._request("GET", f"/api/libraries/{library_id}")
+
+    def scan_library(self, library_id, force=False):
+        return self._request("POST", f"/api/libraries/{library_id}/scan", params={"force": "1" if force else "0"})
+
+
+def abs_config():
+    return {
+        "url": app.config.get("AUDIOBOOKSHELF_URL", AUDIOBOOKSHELF_URL).rstrip("/"),
+        "token": app.config.get("AUDIOBOOKSHELF_API_TOKEN", AUDIOBOOKSHELF_API_TOKEN),
+        "library_id": app.config.get("AUDIOBOOKSHELF_LIBRARY_ID", AUDIOBOOKSHELF_LIBRARY_ID),
+        "import_dir": app.config.get("AUDIOBOOKSHELF_IMPORT_DIR", AUDIOBOOKSHELF_IMPORT_DIR),
+    }
+
+
+def abs_is_configured(config=None):
+    config = config or abs_config()
+    return bool(config["url"] and config["token"] and config["library_id"])
+
+
+def abs_client():
+    factory = app.config.get("ABS_CLIENT_FACTORY")
+    if factory:
+        return factory()
+    return AudiobookshelfClient()
+
+
 def _normalized_hostname(parsed):
     try:
         return (parsed.hostname or "").rstrip(".").lower()
@@ -234,6 +301,8 @@ def is_safe_stream_redirect_url(url):
 def sanitized_error(error):
     if isinstance(error, RealDebridError):
         return "Real-Debrid request failed"
+    if isinstance(error, AudiobookshelfError):
+        return "Audiobookshelf request failed"
     return "Request failed"
 
 
@@ -802,6 +871,57 @@ def api_prepare_book(book_id):
     except Exception as e:
         print(f"[WARNING] API prepare failed for book {book_id}: {e}")
         return jsonify({"message": "Prepare failed"}), 502
+
+
+@app.route("/api/audiobookshelf/status")
+def api_audiobookshelf_status():
+    config = abs_config()
+    base = {
+        "configured": abs_is_configured(config),
+        "reachable": False,
+        "authorized": False,
+        "library_found": False,
+        "import_dir_configured": bool(config["import_dir"]),
+    }
+    if not base["configured"]:
+        return jsonify(base)
+    base["url"] = config["url"]
+    base["library_id"] = config["library_id"]
+    try:
+        client = abs_client()
+        client.healthcheck()
+        library_payload = client.library(config["library_id"])
+        base.update(
+            {
+                "reachable": True,
+                "authorized": True,
+                "library_found": True,
+                "library": {
+                    "id": library_payload.get("id"),
+                    "name": library_payload.get("name"),
+                    "mediaType": library_payload.get("mediaType"),
+                },
+            }
+        )
+    except Exception as e:
+        print(f"[WARNING] Audiobookshelf status failed: {e}")
+        base["message"] = sanitized_error(e)
+    return jsonify(base)
+
+
+@app.route("/api/audiobookshelf/scan", methods=["POST"])
+def api_audiobookshelf_scan():
+    config = abs_config()
+    if not abs_is_configured(config):
+        return jsonify({"message": "Audiobookshelf is not configured"}), 400
+    data = request.get_json(silent=True) or {}
+    force = bool(data.get("force", False))
+    try:
+        abs_client().scan_library(config["library_id"], force=force)
+        return jsonify({"message": "Audiobookshelf scan started", "library_id": config["library_id"]})
+    except Exception as e:
+        print(f"[WARNING] Audiobookshelf scan failed: {e}")
+        return jsonify({"message": sanitized_error(e)}), 502
 
 
 @app.route("/library")

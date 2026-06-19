@@ -20,9 +20,15 @@ ABB_HOSTNAME=audiobookbay.lu                              # optional
 PAGE_LIMIT=5                                              # optional
 DATABASE_PATH=/data/audiobooks.db                         # optional, defaults to ./data/audiobooks.db locally; compose sets /data/audiobooks.db
 FLASK_PORT=5078                                           # optional
+
+# Optional Audiobookshelf integration scaffold. These stay server-side.
+AUDIOBOOKSHELF_URL=http://audiobookshelf:80                # optional
+AUDIOBOOKSHELF_API_TOKEN=your_audiobookshelf_api_token     # optional
+AUDIOBOOKSHELF_LIBRARY_ID=lib_xxx                          # optional
+AUDIOBOOKSHELF_IMPORT_DIR=/abs-import                      # optional future import target
 ```
 
-No OAuth flow is implemented; this is intended for a private/self-hosted app using a Real-Debrid private API token. Keep `REAL_DEBRID_API_TOKEN` server-side only.
+No OAuth flow is implemented; this is intended for a private/self-hosted app using server-side private tokens. Keep both `REAL_DEBRID_API_TOKEN` and `AUDIOBOOKSHELF_API_TOKEN` server-side only.
 
 ## Docker Compose
 
@@ -58,6 +64,25 @@ Open http://localhost:5078.
 - This app does not run a torrent client and does not store downloaded audiobook files.
 - Real-Debrid direct links are generated on demand by `/stream/<file_id>` and returned as redirects.
 - AudioBookBay scraping can break if the site changes its markup or blocks requests.
+
+## Audiobookshelf integration status
+
+This repo now has a minimal server-side Audiobookshelf scaffold for the planned one-app architecture:
+
+```text
+Android app -> Flask sidecar for search/download/jobs
+Android app -> Audiobookshelf API later for library/playback/progress
+```
+
+Current implemented scope is intentionally small:
+
+- `GET /api/audiobookshelf/status` checks whether Audiobookshelf is configured and reachable.
+- `POST /api/audiobookshelf/scan` triggers a scan of the configured Audiobookshelf library.
+- No books are imported into Audiobookshelf yet.
+- Existing Flask playback routes remain unchanged.
+- No Audiobookshelf credentials are sent to the Android app.
+
+Next step: add an explicit import endpoint that takes a completed Real-Debrid book, materializes it into `AUDIOBOOKSHELF_IMPORT_DIR`, then triggers an Audiobookshelf scan.
 
 ## Tests
 

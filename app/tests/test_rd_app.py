@@ -66,6 +66,29 @@ class ZipRealDebrid(FakeRealDebrid):
     def unrestrict_link(self, link):
         return {"download": "https://download.example/book.zip"}
 
+class FakeAudiobookshelf:
+    def __init__(self):
+        self.scans = []
+        self.library_payload = {"id": "lib-1", "name": "Audiobooks", "mediaType": "book"}
+
+    def healthcheck(self):
+        return {"status": "ok"}
+
+    def library(self, library_id):
+        assert library_id == "lib-1"
+        return self.library_payload
+
+    def scan_library(self, library_id, force=False):
+        self.scans.append((library_id, force))
+        return {"started": True}
+
+class FailingAudiobookshelf(FakeAudiobookshelf):
+    def library(self, library_id):
+        raise app_module.AudiobookshelfError("AUDIOBOOKSHELF_API_TOKEN=secret detail")
+
+    def scan_library(self, library_id, force=False):
+        raise app_module.AudiobookshelfError("AUDIOBOOKSHELF_API_TOKEN=secret detail")
+
 class FakeZipDownloadResponse:
     status_code = 200
     headers = {"content-length": "1"}
@@ -82,6 +105,9 @@ class FakeZipDownloadResponse:
 def reset_db(db_path):
     app_module.app.config.pop("RD_CLIENT_FACTORY", None)
     app_module.app.config.pop("ZIP_CACHE_DIR", None)
+    app_module.app.config.pop("ABS_CLIENT_FACTORY", None)
+    for key in ("AUDIOBOOKSHELF_URL", "AUDIOBOOKSHELF_API_TOKEN", "AUDIOBOOKSHELF_LIBRARY_ID", "AUDIOBOOKSHELF_IMPORT_DIR"):
+        app_module.app.config.pop(key, None)
 
     app_module.app.config["DATABASE_PATH"] = str(db_path)
     with app_module.app.app_context():
@@ -478,3 +504,96 @@ def test_send_alias_removed(tmp_path):
     reset_db(tmp_path / "test.db")
     response = app_module.app.test_client().post("/send", json={"title": "Book", "link": SAFE_ABB_LINK})
     assert response.status_code == 404
+
+
+def configure_abs(fake=None):
+    app_module.app.config["AUDIOBOOKSHELF_URL"] = "http://abs.local"
+    app_module.app.config["AUDIOBOOKSHELF_API_TOKEN"] = "abs-secret-token"
+    app_module.app.config["AUDIOBOOKSHELF_LIBRARY_ID"] = "lib-1"
+    app_module.app.config["AUDIOBOOKSHELF_IMPORT_DIR"] = "/abs-import"
+    if fake is not None:
+        app_module.app.config["ABS_CLIENT_FACTORY"] = lambda: fake
+
+
+def test_audiobookshelf_status_unconfigured(tmp_path):
+    reset_db(tmp_path / "test.db")
+
+    response = app_module.app.test_client().get("/api/audiobookshelf/status")
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "configured": False,
+        "reachable": False,
+        "authorized": False,
+        "library_found": False,
+        "import_dir_configured": False,
+    }
+
+
+def test_audiobookshelf_status_configured_without_leaking_token(tmp_path):
+    reset_db(tmp_path / "test.db")
+    configure_abs(FakeAudiobookshelf())
+
+    response = app_module.app.test_client().get("/api/audiobookshelf/status")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["configured"] is True
+    assert payload["url"] == "http://abs.local"
+    assert payload["library_id"] == "lib-1"
+    assert payload["import_dir_configured"] is True
+    assert payload["reachable"] is True
+    assert payload["authorized"] is True
+    assert payload["library_found"] is True
+    assert payload["library"] == {"id": "lib-1", "name": "Audiobooks", "mediaType": "book"}
+    assert b"abs-secret-token" not in response.data
+
+
+def test_audiobookshelf_status_failure_is_sanitized(tmp_path):
+    reset_db(tmp_path / "test.db")
+    configure_abs(FailingAudiobookshelf())
+
+    response = app_module.app.test_client().get("/api/audiobookshelf/status")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["configured"] is True
+    assert payload["reachable"] is False
+    assert payload["authorized"] is False
+    assert payload["library_found"] is False
+    assert payload["message"] == "Audiobookshelf request failed"
+    assert b"abs-secret-token" not in response.data
+    assert b"AUDIOBOOKSHELF_API_TOKEN" not in response.data
+
+
+def test_audiobookshelf_scan_requires_configuration(tmp_path):
+    reset_db(tmp_path / "test.db")
+
+    response = app_module.app.test_client().post("/api/audiobookshelf/scan", json={"force": True})
+
+    assert response.status_code == 400
+    assert response.get_json()["message"] == "Audiobookshelf is not configured"
+
+
+def test_audiobookshelf_scan_triggers_configured_library(tmp_path):
+    reset_db(tmp_path / "test.db")
+    fake = FakeAudiobookshelf()
+    configure_abs(fake)
+
+    response = app_module.app.test_client().post("/api/audiobookshelf/scan", json={"force": True})
+
+    assert response.status_code == 200
+    assert response.get_json() == {"message": "Audiobookshelf scan started", "library_id": "lib-1"}
+    assert fake.scans == [("lib-1", True)]
+
+
+def test_audiobookshelf_scan_failure_is_sanitized(tmp_path):
+    reset_db(tmp_path / "test.db")
+    configure_abs(FailingAudiobookshelf())
+
+    response = app_module.app.test_client().post("/api/audiobookshelf/scan", json={"force": False})
+
+    assert response.status_code == 502
+    assert response.get_json()["message"] == "Audiobookshelf request failed"
+    assert b"AUDIOBOOKSHELF_API_TOKEN" not in response.data
+    assert b"abs-secret-token" not in response.data
