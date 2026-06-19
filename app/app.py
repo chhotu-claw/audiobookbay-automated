@@ -1105,6 +1105,48 @@ def library():
     return render_template("library.html", books=books)
 
 
+@app.route("/library/<int:book_id>/import-to-audiobookshelf", methods=["POST"])
+def import_book_to_audiobookshelf_route(book_id):
+    config = abs_config()
+    if not abs_is_configured(config) or not config["import_dir"]:
+        return redirect(url_for("book_player", book_id=book_id, import_error="Audiobookshelf import is not configured"))
+
+    book = get_book(book_id)
+    if not book:
+        abort(404)
+
+    maybe_auto_sync_book(book_id)
+    book = get_book(book_id)
+    if book["status"] != "downloaded" or int(book["progress"] or 0) < 100:
+        return redirect(url_for("book_player", book_id=book_id, import_error="Book is not downloaded yet"))
+
+    files = get_db().execute(
+        """
+        SELECT files.*, books.title AS book_title
+        FROM files
+        JOIN books ON books.id = files.book_id
+        WHERE files.book_id = ? AND files.selected = 1
+        ORDER BY files.rd_link_index
+        """,
+        (book_id,),
+    ).fetchall()
+
+    try:
+        target_dir = import_destination_for_book(book, config["import_dir"])
+        imported_files = import_book_audio_to_directory(book, files, target_dir)
+        if not imported_files:
+            return redirect(url_for("book_player", book_id=book_id, import_error="No playable audio files to import"))
+        abs_client().scan_library(config["library_id"], force=True)
+        return redirect(url_for("book_player", book_id=book_id, imported=len(imported_files)))
+    except Exception as e:
+        print(f"[WARNING] Audiobookshelf web import failed for book {book_id}")
+        if isinstance(e, (RealDebridError, AudiobookshelfError)):
+            message = sanitized_error(e)
+        else:
+            message = "Import failed"
+        return redirect(url_for("book_player", book_id=book_id, import_error=message))
+
+
 @app.route("/library/<int:book_id>/sync", methods=["POST"])
 def sync_book_route(book_id):
     try:

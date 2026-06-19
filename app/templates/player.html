@@ -29,10 +29,15 @@
                 </div>
             </div>
             {% if book.error %}<p class="notice error-message"><strong>Error:</strong> {{ book.error }}</p>{% endif %}
+            {% if request.args.get('imported') %}<p class="notice"><strong>Imported:</strong> {{ request.args.get('imported') }} files sent to Audiobookshelf.</p>{% endif %}
+            {% if request.args.get('import_error') %}<p class="notice error-message"><strong>Import:</strong> {{ request.args.get('import_error') }}</p>{% endif %}
             <div class="player-actions">
                 <a class="button-link button-secondary" href="{{ book.abb_link }}" target="_blank" rel="noopener">AudioBookBay details</a>
                 <form method="post" action="{{ url_for('sync_book_route', book_id=book.id) }}" class="inline-form">
                     <button type="submit">Sync from Real-Debrid</button>
+                </form>
+                <form method="post" action="{{ url_for('import_book_to_audiobookshelf_route', book_id=book.id) }}" class="inline-form">
+                    <button type="submit" {% if book.status != 'downloaded' or (book.progress|int) < 100 %}disabled{% endif %}>Import to Audiobookshelf</button>
                 </form>
             </div>
         </div>

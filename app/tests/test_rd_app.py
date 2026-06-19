@@ -832,3 +832,31 @@ def test_audiobookshelf_import_does_not_log_direct_download_token(tmp_path, monk
     assert "download-secret" not in captured.out
     assert "download-secret" not in captured.err
     assert b"download-secret" not in response.data
+
+
+def test_web_player_exposes_audiobookshelf_import_action(tmp_path):
+    reset_db(tmp_path / "test.db")
+    book_id = insert_book_with_file(title="A Lemon Tree")
+
+    response = app_module.app.test_client().get(f"/book/{book_id}")
+
+    assert response.status_code == 200
+    body = response.get_data(as_text=True)
+    assert f"/library/{book_id}/import-to-audiobookshelf" in body
+    assert "Import to Audiobookshelf" in body
+
+
+def test_web_import_redirects_to_player_after_success(tmp_path, monkeypatch):
+    reset_db(tmp_path / "test.db")
+    fake_abs = FakeAudiobookshelf()
+    configure_abs(fake_abs)
+    app_module.app.config["AUDIOBOOKSHELF_IMPORT_DIR"] = str(tmp_path / "abs-import")
+    monkeypatch.setattr(app_module.requests, "get", lambda *args, **kwargs: FakeZipDownloadResponse(b"mp3-audio"))
+    app_module.app.config["RD_CLIENT_FACTORY"] = lambda: FakeRealDebrid()
+    book_id = insert_book_with_file(title="A Lemon Tree", filename="Chapter 01.mp3", streamable=1)
+
+    response = app_module.app.test_client().post(f"/library/{book_id}/import-to-audiobookshelf")
+
+    assert response.status_code == 302
+    assert response.headers["Location"].endswith(f"/book/{book_id}?imported=1")
+    assert (tmp_path / "abs-import" / "A Lemon Tree" / "001 - Chapter 01.mp3").exists()
