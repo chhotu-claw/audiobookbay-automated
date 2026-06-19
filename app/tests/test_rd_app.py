@@ -375,6 +375,45 @@ def test_m4b_archive_entries_are_served_as_audio_mp4():
     assert app_module.guess_audio_mimetype("Book.m4b") == "audio/mp4"
 
 
+
+def test_api_library_and_book_return_playback_urls(tmp_path):
+    reset_db(tmp_path / "test.db")
+    fake_rd = FakeRealDebrid()
+    app_module.app.config["RD_CLIENT_FACTORY"] = lambda: fake_rd
+    with app_module.app.app_context():
+        db = app_module.get_db()
+        db.execute(
+            "INSERT INTO books (title, abb_link, status, progress, added_at, updated_at, rd_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("Book", "https://audiobookbay.lu/book", "downloaded", 100, app_module.now_iso(), app_module.now_iso(), "rd-1"),
+        )
+        book_id = db.execute("SELECT id FROM books").fetchone()["id"]
+        db.execute(
+            "INSERT INTO files (book_id, rd_link_index, rd_link, filename, bytes, streamable, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (book_id, 0, "https://rd.example/link-1", "Chapter.mp3", 1234, 1, app_module.now_iso(), app_module.now_iso()),
+        )
+        db.commit()
+
+    client = app_module.app.test_client()
+    library = client.get("/api/library")
+    assert library.status_code == 200
+    assert library.json["books"][0]["title"] == "Book"
+
+    detail = client.get(f"/api/books/{book_id}")
+    assert detail.status_code == 200
+    assert detail.json["book"]["id"] == book_id
+    assert detail.json["files"][0]["stream_url"].startswith("/stream/")
+
+
+def test_api_search_uses_existing_scraper(tmp_path, monkeypatch):
+    reset_db(tmp_path / "test.db")
+    monkeypatch.setattr(app_module, "search_audiobookbay", lambda query: [{"title": "Result", "link": SAFE_ABB_LINK}])
+
+    response = app_module.app.test_client().get("/api/search?q=result")
+
+    assert response.status_code == 200
+    assert response.json["query"] == "result"
+    assert response.json["books"] == [{"title": "Result", "link": SAFE_ABB_LINK}]
+
 def test_send_alias_removed(tmp_path):
     reset_db(tmp_path / "test.db")
     response = app_module.app.test_client().post("/send", json={"title": "Book", "link": SAFE_ABB_LINK})

@@ -68,6 +68,11 @@ instance/
 # Local app data
 /data/
 
+# Android local build state
+android-app/.gradle/
+android-app/local.properties
+android-app/**/build/
+
 # Scrapy stuff:
 .scrapy
 

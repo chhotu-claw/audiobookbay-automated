@@ -708,6 +708,78 @@ def api_add():
         return jsonify({"message": safe_message, "book_id": book_id}), 502
 
 
+def serialize_book(book):
+    return {
+        "id": book["id"],
+        "title": book["title"],
+        "cover": book["cover"],
+        "language": book["language"],
+        "format": book["format"],
+        "bitrate": book["bitrate"],
+        "file_size": book["file_size"],
+        "post_date": book["post_date"],
+        "status": book["status"],
+        "progress": book["progress"],
+        "error": book["error"],
+        "library_url": url_for("book_player", book_id=book["id"]),
+    }
+
+
+def serialize_playback_item(item):
+    return {
+        "filename": item["filename"],
+        "bytes": item["bytes"],
+        "streamable": item["streamable"],
+        "stream_url": item["stream_url"],
+        "download_url": item["stream_url"],
+        "note": item["note"],
+    }
+
+
+@app.route("/api/search")
+def api_search():
+    query = request.args.get("q", "").strip()
+    if not query:
+        return jsonify({"query": query, "books": []})
+    try:
+        return jsonify({"query": query, "books": search_audiobookbay(query)})
+    except Exception as e:
+        print(f"[WARNING] API search failed: {e}")
+        return jsonify({"message": "Search failed"}), 502
+
+
+@app.route("/api/library")
+def api_library():
+    auto_sync_books()
+    books = get_db().execute("SELECT * FROM books ORDER BY added_at DESC").fetchall()
+    return jsonify({"books": [serialize_book(book) for book in books]})
+
+
+@app.route("/api/books/<int:book_id>")
+def api_book(book_id):
+    book = get_book(book_id)
+    if not book:
+        abort(404)
+    maybe_auto_sync_book(book_id)
+    book = get_book(book_id)
+    files = get_db().execute("SELECT * FROM files WHERE book_id = ? ORDER BY rd_link_index", (book_id,)).fetchall()
+    playback_items = playback_items_for_files(files)
+    return jsonify({"book": serialize_book(book), "files": [serialize_playback_item(item) for item in playback_items]})
+
+
+@app.route("/api/books/<int:book_id>/prepare", methods=["POST"])
+def api_prepare_book(book_id):
+    if not get_book(book_id):
+        abort(404)
+    try:
+        sync_book(book_id)
+        book = get_book(book_id)
+        return jsonify({"message": "Prepared", "book": serialize_book(book)})
+    except Exception as e:
+        print(f"[WARNING] API prepare failed for book {book_id}: {e}")
+        return jsonify({"message": "Prepare failed"}), 502
+
+
 @app.route("/library")
 def library():
     auto_sync_books()
