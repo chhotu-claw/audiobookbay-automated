@@ -7,8 +7,11 @@ WORKDIR /app
 # Copy the app directory contents into the container
 COPY /app /app
 
-# Install any necessary dependencies
-RUN pip install --no-cache-dir -r /app/requirements.txt
+# Install system and Python dependencies. 7z is used to inspect/play RAR/7z audiobook archives.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends p7zip-full \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir -r /app/requirements.txt
 
 # Expose the port the app runs on
 EXPOSE 5078

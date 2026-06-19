@@ -4,11 +4,12 @@ import re
 import ipaddress
 import sqlite3
 import socket
+import subprocess
 import tempfile
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from urllib.parse import quote, quote_plus, urlparse
+from urllib.parse import quote, quote_plus, unquote, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -43,7 +44,9 @@ REAL_DEBRID_API_TOKEN = os.getenv("REAL_DEBRID_API_TOKEN", "")
 REAL_DEBRID_API_BASE = os.getenv("REAL_DEBRID_API_BASE", "https://api.real-debrid.com/rest/1.0")
 AUDIO_EXTENSIONS = (".mp3", ".m4a", ".m4b", ".aac", ".flac", ".ogg", ".opus", ".wav", ".wma")
 ZIP_EXTENSIONS = (".zip",)
+ARCHIVE_EXTENSIONS = (".zip", ".rar", ".7z")
 ZIP_CACHE_DIR = os.getenv("ZIP_CACHE_DIR", "data/cache")
+SEVEN_ZIP_BINARY = os.getenv("SEVEN_ZIP_BINARY", "7z")
 
 print(f"ABB_HOSTNAME: {ABB_HOSTNAME}")
 print(f"PAGE_LIMIT: {PAGE_LIMIT}")
@@ -309,8 +312,31 @@ def is_streamable(filename):
     return filename.lower().endswith(AUDIO_EXTENSIONS)
 
 
+def guess_audio_mimetype(filename):
+    lower = filename.lower()
+    if lower.endswith(".m4b"):
+        return "audio/mp4"
+    if lower.endswith(".m4a"):
+        return "audio/mp4"
+    if lower.endswith(".opus"):
+        return "audio/ogg"
+    return mimetypes.guess_type(filename)[0] or "application/octet-stream"
+
+
 def is_zip_file(filename):
     return filename.lower().endswith(ZIP_EXTENSIONS)
+
+
+def archive_extension_from_name(name):
+    path = unquote(urlparse(name).path if "://" in name else name).lower()
+    for extension in ARCHIVE_EXTENSIONS:
+        if path.endswith(extension):
+            return extension
+    return None
+
+
+def is_archive_url(url):
+    return archive_extension_from_name(url) is not None
 
 
 def get_zip_cache_dir():
@@ -319,21 +345,28 @@ def get_zip_cache_dir():
     return cache_dir
 
 
+def archive_cache_path(file_id, extension=".zip"):
+    extension = extension if extension in ARCHIVE_EXTENSIONS else ".archive"
+    return get_zip_cache_dir() / f"rd-file-{int(file_id)}{extension}"
+
+
 def zip_cache_path(file_id):
-    return get_zip_cache_dir() / f"rd-file-{int(file_id)}.zip"
+    return archive_cache_path(file_id, ".zip")
 
 
-def download_rd_file_to_cache(file_row):
-    if not file_row["rd_link"]:
-        raise RealDebridError("No Real-Debrid link available yet; sync the book first.")
-    unrestricted = rd_client().unrestrict_link(file_row["rd_link"])
-    direct = unrestricted.get("download") or unrestricted.get("link")
+def download_rd_file_to_cache(file_row, direct=None, extension=None):
+    if not direct:
+        if not file_row["rd_link"]:
+            raise RealDebridError("No Real-Debrid link available yet; sync the book first.")
+        unrestricted = rd_client().unrestrict_link(file_row["rd_link"])
+        direct = unrestricted.get("download") or unrestricted.get("link")
     if not direct:
         raise RealDebridError("Real-Debrid did not return a downloadable direct link")
     if not is_safe_stream_redirect_url(direct):
         raise RealDebridError("Real-Debrid returned an unsafe stream URL")
 
-    destination = zip_cache_path(file_row["id"])
+    extension = extension or archive_extension_from_name(direct) or archive_extension_from_name(file_row["filename"]) or ".zip"
+    destination = archive_cache_path(file_row["id"], extension)
     fd, tmp_name = tempfile.mkstemp(prefix=f"{destination.name}.", suffix=".tmp", dir=str(destination.parent))
     try:
         with os.fdopen(fd, "wb") as tmp_file:
@@ -352,10 +385,16 @@ def download_rd_file_to_cache(file_row):
     return destination
 
 
+def is_safe_archive_member(name):
+    normalized_name = name.replace("\\", "/")
+    parts = PurePosixPath(normalized_name).parts
+    return bool(normalized_name) and not PurePosixPath(normalized_name).is_absolute() and ".." not in parts
+
+
 def ensure_zip_cached(file_row):
     path = zip_cache_path(file_row["id"])
     if not path.exists() or path.stat().st_size == 0:
-        path = download_rd_file_to_cache(file_row)
+        path = download_rd_file_to_cache(file_row, extension=".zip")
     if not zipfile.is_zipfile(path):
         try:
             path.unlink(missing_ok=True)
@@ -365,35 +404,108 @@ def ensure_zip_cached(file_row):
     return path
 
 
+def ensure_archive_cached(file_row, direct=None, extension=None):
+    extension = extension or (archive_extension_from_name(direct) if direct else None) or archive_extension_from_name(file_row["filename"]) or ".zip"
+    path = archive_cache_path(file_row["id"], extension)
+    if not path.exists() or path.stat().st_size == 0:
+        path = download_rd_file_to_cache(file_row, direct=direct, extension=extension)
+    if zipfile.is_zipfile(path):
+        return path
+    # Validate non-ZIP archives through 7z so bad downloads fail before playback.
+    seven_zip_audio_infos(path)
+    return path
+
+
 def safe_zip_audio_infos(zip_path):
     entries = []
     with zipfile.ZipFile(zip_path) as archive:
         for info in archive.infolist():
             normalized_name = info.filename.replace("\\", "/")
-            parts = PurePosixPath(normalized_name).parts
-            if info.is_dir() or PurePosixPath(normalized_name).is_absolute() or ".." in parts:
+            if info.is_dir() or not is_safe_archive_member(normalized_name):
                 continue
             if not is_streamable(normalized_name):
                 continue
-            entries.append(info)
+            entries.append({"name": info.filename, "size": info.file_size, "zip_info": info})
     return entries
 
 
-def zip_playback_items(file_row):
-    zip_path = ensure_zip_cached(file_row)
+def parse_7z_slt(output):
+    entries = []
+    current = {}
+    in_listing = False
+    for raw_line in output.splitlines():
+        line = raw_line.rstrip("\n")
+        if line == "----------":
+            in_listing = True
+            current = {}
+            continue
+        if not in_listing:
+            continue
+        if not line:
+            if current.get("Path"):
+                entries.append(current)
+            current = {}
+            continue
+        if " = " in line:
+            key, value = line.split(" = ", 1)
+            current[key] = value
+    if current.get("Path"):
+        entries.append(current)
+    return entries
+
+
+def seven_zip_audio_infos(archive_path):
+    try:
+        result = subprocess.run(
+            [SEVEN_ZIP_BINARY, "l", "-slt", str(archive_path)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise RealDebridError("Archive playback requires 7z to be installed on the server") from exc
+    if result.returncode != 0:
+        raise RealDebridError("Downloaded Real-Debrid file is not a supported archive")
+
+    entries = []
+    for entry in parse_7z_slt(result.stdout):
+        name = entry.get("Path", "")
+        if entry.get("Folder") == "+" or not is_safe_archive_member(name) or not is_streamable(name):
+            continue
+        try:
+            size = int(entry.get("Size") or 0)
+        except ValueError:
+            size = 0
+        entries.append({"name": name, "size": size, "zip_info": None})
+    return entries
+
+
+def archive_audio_infos(archive_path):
+    if zipfile.is_zipfile(archive_path):
+        return safe_zip_audio_infos(archive_path)
+    return seven_zip_audio_infos(archive_path)
+
+
+def archive_playback_items(file_row):
+    archive_path = ensure_archive_cached(file_row)
     items = []
-    for index, info in enumerate(safe_zip_audio_infos(zip_path)):
-        display_name = PurePosixPath(info.filename.replace("\\", "/")).name or info.filename
+    for index, info in enumerate(archive_audio_infos(archive_path)):
+        display_name = PurePosixPath(info["name"].replace("\\", "/")).name or info["name"]
         items.append(
             {
                 "filename": display_name,
-                "bytes": info.file_size,
+                "bytes": info["size"],
                 "streamable": True,
                 "stream_url": url_for("stream_zip_entry", file_id=file_row["id"], entry_index=index),
                 "note": f"Inside {file_row['filename']}",
             }
         )
     return items
+
+
+def zip_playback_items(file_row):
+    return archive_playback_items(file_row)
 
 
 def playback_items_for_files(files):
@@ -409,18 +521,18 @@ def playback_items_for_files(files):
                     "note": None,
                 }
             )
-        elif is_zip_file(file_row["filename"]):
+        elif archive_extension_from_name(file_row["filename"]):
             try:
-                items.extend(zip_playback_items(file_row))
+                items.extend(archive_playback_items(file_row))
             except Exception as e:
-                print(f"[WARNING] ZIP inspection failed for file {file_row['id']}: {e}")
+                print(f"[WARNING] Archive inspection failed for file {file_row['id']}: {e}")
                 items.append(
                     {
                         "filename": file_row["filename"],
                         "bytes": file_row["bytes"],
                         "streamable": False,
                         "stream_url": None,
-                        "note": "ZIP archive could not be inspected yet.",
+                        "note": "Archive could not be inspected yet.",
                     }
                 )
         else:
@@ -639,35 +751,74 @@ def stream(file_id):
             raise RealDebridError("Real-Debrid did not return a playable direct link")
         if not is_safe_stream_redirect_url(direct):
             raise RealDebridError("Real-Debrid returned an unsafe stream URL")
+        if is_archive_url(direct):
+            archive_path = ensure_archive_cached(file_row, direct=direct, extension=archive_extension_from_name(direct))
+            entries = archive_audio_infos(archive_path)
+            if not entries:
+                raise RealDebridError("Archive did not contain playable audio files")
+            return stream_archive_entry_response(archive_path, entries[0])
         return redirect(direct, code=302)
     except Exception as e:
         print(f"[WARNING] Stream failed for file {file_id}: {e}")
         abort(502, sanitized_error(e))
 
 
+def stream_archive_entry_response(archive_path, entry):
+    name = entry["name"]
+    mimetype = guess_audio_mimetype(name)
+    display_name = PurePosixPath(name.replace("\\", "/")).name or "audio"
+
+    if zipfile.is_zipfile(archive_path) and entry.get("zip_info") is not None:
+        with zipfile.ZipFile(archive_path) as archive:
+            data = archive.read(entry["zip_info"])
+        response = Response(data, mimetype=mimetype)
+        response.headers["Content-Length"] = str(len(data))
+    else:
+        try:
+            process = subprocess.Popen(
+                [SEVEN_ZIP_BINARY, "x", "-so", str(archive_path), name],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except FileNotFoundError as exc:
+            raise RealDebridError("Archive playback requires 7z to be installed on the server") from exc
+
+        def generate():
+            try:
+                while True:
+                    chunk = process.stdout.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    yield chunk
+            finally:
+                stderr = process.stderr.read() if process.stderr else b""
+                return_code = process.wait()
+                if return_code != 0:
+                    print(f"[WARNING] 7z extraction failed for {archive_path}: {stderr.decode(errors='ignore')[:500]}")
+
+        response = Response(generate(), mimetype=mimetype)
+        if entry.get("size"):
+            response.headers["Content-Length"] = str(entry["size"])
+
+    response.headers["Content-Disposition"] = f"inline; filename*=UTF-8''{quote(display_name)}"
+    return response
+
+
 @app.route("/stream-zip/<int:file_id>/<int:entry_index>")
 def stream_zip_entry(file_id, entry_index):
     file_row = get_db().execute("SELECT files.*, books.title AS book_title FROM files JOIN books ON books.id = files.book_id WHERE files.id = ?", (file_id,)).fetchone()
-    if not file_row or not is_zip_file(file_row["filename"]):
+    if not file_row or not archive_extension_from_name(file_row["filename"]):
         abort(404)
     try:
-        zip_path = ensure_zip_cached(file_row)
-        entries = safe_zip_audio_infos(zip_path)
+        archive_path = ensure_archive_cached(file_row)
+        entries = archive_audio_infos(archive_path)
         if entry_index < 0 or entry_index >= len(entries):
             abort(404)
-        info = entries[entry_index]
-        with zipfile.ZipFile(zip_path) as archive:
-            data = archive.read(info)
-        mimetype = mimetypes.guess_type(info.filename)[0] or "application/octet-stream"
-        display_name = PurePosixPath(info.filename.replace("\\", "/")).name or "audio"
-        response = Response(data, mimetype=mimetype)
-        response.headers["Content-Length"] = str(len(data))
-        response.headers["Content-Disposition"] = f"inline; filename*=UTF-8''{quote(display_name)}"
-        return response
+        return stream_archive_entry_response(archive_path, entries[entry_index])
     except Exception as e:
         if getattr(e, "code", None) == 404:
             raise
-        print(f"[WARNING] ZIP stream failed for file {file_id} entry {entry_index}: {e}")
+        print(f"[WARNING] Archive stream failed for file {file_id} entry {entry_index}: {e}")
         abort(502, sanitized_error(e))
 
 

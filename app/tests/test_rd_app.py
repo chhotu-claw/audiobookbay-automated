@@ -56,6 +56,12 @@ class UnsafeStreamRealDebrid(FakeRealDebrid):
     def unrestrict_link(self, link):
         return {"download": "http://127.0.0.1/private.mp3"}
 
+
+class ArchiveStreamRealDebrid(FakeRealDebrid):
+    def unrestrict_link(self, link):
+        return {"download": "https://download.example/Book.rar"}
+
+
 class ZipRealDebrid(FakeRealDebrid):
     def unrestrict_link(self, link):
         return {"download": "https://download.example/book.zip"}
@@ -279,6 +285,34 @@ def test_stream_rejects_unsafe_redirect_url(tmp_path):
     assert "Location" not in response.headers
 
 
+def test_stream_serves_first_audio_when_real_debrid_returns_archive_for_audio_file(tmp_path, monkeypatch):
+    reset_db(tmp_path / "test.db")
+    app_module.app.config["ZIP_CACHE_DIR"] = str(tmp_path / "zip-cache")
+    app_module.app.config["RD_CLIENT_FACTORY"] = lambda: ArchiveStreamRealDebrid()
+    zip_bytes = build_test_zip()
+    monkeypatch.setattr(app_module.requests, "get", lambda *args, **kwargs: FakeZipDownloadResponse(zip_bytes))
+    with app_module.app.app_context():
+        db = app_module.get_db()
+        db.execute(
+            "INSERT INTO books (title, abb_link, status, progress, added_at, updated_at, rd_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("Book", "https://audiobookbay.lu/book", "downloaded", 100, app_module.now_iso(), app_module.now_iso(), "rd-1"),
+        )
+        book_id = db.execute("SELECT id FROM books").fetchone()["id"]
+        db.execute(
+            "INSERT INTO files (book_id, rd_link_index, rd_link, filename, streamable, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (book_id, 0, "https://rd.example/link-1", "Chapter.mp3", 1, app_module.now_iso(), app_module.now_iso()),
+        )
+        file_id = db.execute("SELECT id FROM files").fetchone()["id"]
+        db.commit()
+
+    response = app_module.app.test_client().get(f"/stream/{file_id}")
+
+    assert response.status_code == 200
+    assert response.data == b"mp3-audio"
+    assert response.headers["Content-Type"].startswith("audio/mpeg")
+    assert "Location" not in response.headers
+
+
 def test_player_lists_audio_entries_inside_zip_without_exposing_direct_url(tmp_path, monkeypatch):
     reset_db(tmp_path / "test.db")
     app_module.app.config["ZIP_CACHE_DIR"] = str(tmp_path / "zip-cache")
@@ -335,6 +369,10 @@ def test_stream_zip_entry_serves_audio_from_cached_archive(tmp_path, monkeypatch
     assert response.status_code == 200
     assert response.data == b"mp3-audio"
     assert response.headers["Content-Type"].startswith("audio/mpeg")
+
+
+def test_m4b_archive_entries_are_served_as_audio_mp4():
+    assert app_module.guess_audio_mimetype("Book.m4b") == "audio/mp4"
 
 
 def test_send_alias_removed(tmp_path):
