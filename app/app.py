@@ -1,16 +1,19 @@
+import mimetypes
 import os
 import re
 import ipaddress
 import sqlite3
 import socket
+import tempfile
+import zipfile
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.parse import quote, quote_plus, urlparse
 
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from flask import Flask, abort, g, jsonify, redirect, render_template, request, url_for
+from flask import Flask, Response, abort, g, jsonify, redirect, render_template, request, url_for
 
 load_dotenv()
 
@@ -39,6 +42,8 @@ DATABASE_PATH = os.getenv("DATABASE_PATH", "data/audiobooks.db")
 REAL_DEBRID_API_TOKEN = os.getenv("REAL_DEBRID_API_TOKEN", "")
 REAL_DEBRID_API_BASE = os.getenv("REAL_DEBRID_API_BASE", "https://api.real-debrid.com/rest/1.0")
 AUDIO_EXTENSIONS = (".mp3", ".m4a", ".m4b", ".aac", ".flac", ".ogg", ".opus", ".wav", ".wma")
+ZIP_EXTENSIONS = (".zip",)
+ZIP_CACHE_DIR = os.getenv("ZIP_CACHE_DIR", "data/cache")
 
 print(f"ABB_HOSTNAME: {ABB_HOSTNAME}")
 print(f"PAGE_LIMIT: {PAGE_LIMIT}")
@@ -304,6 +309,133 @@ def is_streamable(filename):
     return filename.lower().endswith(AUDIO_EXTENSIONS)
 
 
+def is_zip_file(filename):
+    return filename.lower().endswith(ZIP_EXTENSIONS)
+
+
+def get_zip_cache_dir():
+    cache_dir = Path(app.config.get("ZIP_CACHE_DIR", ZIP_CACHE_DIR))
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
+
+
+def zip_cache_path(file_id):
+    return get_zip_cache_dir() / f"rd-file-{int(file_id)}.zip"
+
+
+def download_rd_file_to_cache(file_row):
+    if not file_row["rd_link"]:
+        raise RealDebridError("No Real-Debrid link available yet; sync the book first.")
+    unrestricted = rd_client().unrestrict_link(file_row["rd_link"])
+    direct = unrestricted.get("download") or unrestricted.get("link")
+    if not direct:
+        raise RealDebridError("Real-Debrid did not return a downloadable direct link")
+    if not is_safe_stream_redirect_url(direct):
+        raise RealDebridError("Real-Debrid returned an unsafe stream URL")
+
+    destination = zip_cache_path(file_row["id"])
+    fd, tmp_name = tempfile.mkstemp(prefix=f"{destination.name}.", suffix=".tmp", dir=str(destination.parent))
+    try:
+        with os.fdopen(fd, "wb") as tmp_file:
+            response = requests.get(direct, stream=True, timeout=60)
+            response.raise_for_status()
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    tmp_file.write(chunk)
+        Path(tmp_name).replace(destination)
+    except Exception:
+        try:
+            Path(tmp_name).unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    return destination
+
+
+def ensure_zip_cached(file_row):
+    path = zip_cache_path(file_row["id"])
+    if not path.exists() or path.stat().st_size == 0:
+        path = download_rd_file_to_cache(file_row)
+    if not zipfile.is_zipfile(path):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise RealDebridError("Downloaded Real-Debrid file is not a valid ZIP archive")
+    return path
+
+
+def safe_zip_audio_infos(zip_path):
+    entries = []
+    with zipfile.ZipFile(zip_path) as archive:
+        for info in archive.infolist():
+            normalized_name = info.filename.replace("\\", "/")
+            parts = PurePosixPath(normalized_name).parts
+            if info.is_dir() or PurePosixPath(normalized_name).is_absolute() or ".." in parts:
+                continue
+            if not is_streamable(normalized_name):
+                continue
+            entries.append(info)
+    return entries
+
+
+def zip_playback_items(file_row):
+    zip_path = ensure_zip_cached(file_row)
+    items = []
+    for index, info in enumerate(safe_zip_audio_infos(zip_path)):
+        display_name = PurePosixPath(info.filename.replace("\\", "/")).name or info.filename
+        items.append(
+            {
+                "filename": display_name,
+                "bytes": info.file_size,
+                "streamable": True,
+                "stream_url": url_for("stream_zip_entry", file_id=file_row["id"], entry_index=index),
+                "note": f"Inside {file_row['filename']}",
+            }
+        )
+    return items
+
+
+def playback_items_for_files(files):
+    items = []
+    for file_row in files:
+        if file_row["streamable"]:
+            items.append(
+                {
+                    "filename": file_row["filename"],
+                    "bytes": file_row["bytes"],
+                    "streamable": True,
+                    "stream_url": url_for("stream", file_id=file_row["id"]),
+                    "note": None,
+                }
+            )
+        elif is_zip_file(file_row["filename"]):
+            try:
+                items.extend(zip_playback_items(file_row))
+            except Exception as e:
+                print(f"[WARNING] ZIP inspection failed for file {file_row['id']}: {e}")
+                items.append(
+                    {
+                        "filename": file_row["filename"],
+                        "bytes": file_row["bytes"],
+                        "streamable": False,
+                        "stream_url": None,
+                        "note": "ZIP archive could not be inspected yet.",
+                    }
+                )
+        else:
+            items.append(
+                {
+                    "filename": file_row["filename"],
+                    "bytes": file_row["bytes"],
+                    "streamable": False,
+                    "stream_url": None,
+                    "note": None,
+                }
+            )
+    return items
+
+
 def row_to_dict(row):
     return dict(row) if row else None
 
@@ -489,7 +621,8 @@ def book_player(book_id):
     maybe_auto_sync_book(book_id)
     book = get_book(book_id)
     files = get_db().execute("SELECT * FROM files WHERE book_id = ? ORDER BY rd_link_index", (book_id,)).fetchall()
-    return render_template("player.html", book=book, files=files)
+    playback_items = playback_items_for_files(files)
+    return render_template("player.html", book=book, files=files, playback_items=playback_items)
 
 
 @app.route("/stream/<int:file_id>")
@@ -509,6 +642,32 @@ def stream(file_id):
         return redirect(direct, code=302)
     except Exception as e:
         print(f"[WARNING] Stream failed for file {file_id}: {e}")
+        abort(502, sanitized_error(e))
+
+
+@app.route("/stream-zip/<int:file_id>/<int:entry_index>")
+def stream_zip_entry(file_id, entry_index):
+    file_row = get_db().execute("SELECT files.*, books.title AS book_title FROM files JOIN books ON books.id = files.book_id WHERE files.id = ?", (file_id,)).fetchone()
+    if not file_row or not is_zip_file(file_row["filename"]):
+        abort(404)
+    try:
+        zip_path = ensure_zip_cached(file_row)
+        entries = safe_zip_audio_infos(zip_path)
+        if entry_index < 0 or entry_index >= len(entries):
+            abort(404)
+        info = entries[entry_index]
+        with zipfile.ZipFile(zip_path) as archive:
+            data = archive.read(info)
+        mimetype = mimetypes.guess_type(info.filename)[0] or "application/octet-stream"
+        display_name = PurePosixPath(info.filename.replace("\\", "/")).name or "audio"
+        response = Response(data, mimetype=mimetype)
+        response.headers["Content-Length"] = str(len(data))
+        response.headers["Content-Disposition"] = f"inline; filename*=UTF-8''{quote(display_name)}"
+        return response
+    except Exception as e:
+        if getattr(e, "code", None) == 404:
+            raise
+        print(f"[WARNING] ZIP stream failed for file {file_id} entry {entry_index}: {e}")
         abort(502, sanitized_error(e))
 
 

@@ -44,24 +44,26 @@
         <p class="section-kicker">Playback</p>
         <h2 id="files-title">Files</h2>
     </div>
-    {% if not files %}
+    {% set display_files = playback_items if playback_items is defined else files %}
+    {% if not display_files %}
     <div class="empty-state subtle">
         <p>No playable files are available yet. Sync after Real-Debrid finishes downloading.</p>
     </div>
     {% else %}
         <div class="file-list">
-        {% for file in files %}
+        {% for file in display_files %}
             <article class="file-card">
                 <div class="file-card-heading">
                     <p class="file-title">{{ file.filename }}</p>
                     {% if file.bytes %}<span class="file-size">{{ (file.bytes / 1024 / 1024)|round(2) }} MB</span>{% endif %}
                 </div>
+                {% if file.note %}<p class="muted">{{ file.note }}</p>{% endif %}
                 {% if file.streamable %}
                     <audio controls preload="none">
-                        <source src="{{ url_for('stream', file_id=file.id) }}">
+                        <source src="{{ file.stream_url }}">
                         Your browser does not support the audio element.
                     </audio>
-                    <p><a class="text-link" href="{{ url_for('stream', file_id=file.id) }}">Open stream</a></p>
+                    <p><a class="text-link" href="{{ file.stream_url }}">Open stream</a></p>
                 {% else %}
                     <p class="muted">This file type is not playable in the browser.</p>
                 {% endif %}
