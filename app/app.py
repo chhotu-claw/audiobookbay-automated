@@ -11,7 +11,7 @@ import tempfile
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from urllib.parse import quote, quote_plus, unquote, urlparse
+from urllib.parse import quote, quote_plus, unquote, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -425,6 +425,31 @@ def zip_cache_path(file_id):
     return archive_cache_path(file_id, ".zip")
 
 
+def safe_streaming_get(url, timeout=60, max_redirects=5):
+    current = url
+    for _ in range(max_redirects + 1):
+        try:
+            response = requests.get(current, stream=True, timeout=timeout, allow_redirects=False)
+        except requests.exceptions.RequestException as exc:
+            raise RealDebridError("Real-Debrid download failed") from exc
+        if response.status_code in {301, 302, 303, 307, 308}:
+            location = response.headers.get("location") or response.headers.get("Location")
+            if hasattr(response, "close"):
+                response.close()
+            if not location:
+                raise RealDebridError("Real-Debrid download redirected without a Location header")
+            current = urljoin(current, location)
+            if not is_safe_stream_redirect_url(current):
+                raise RealDebridError("Real-Debrid returned an unsafe stream redirect URL")
+            continue
+        try:
+            response.raise_for_status()
+        except requests.exceptions.RequestException as exc:
+            raise RealDebridError("Real-Debrid download failed") from exc
+        return response
+    raise RealDebridError("Real-Debrid download redirected too many times")
+
+
 def download_rd_file_to_cache(file_row, direct=None, extension=None):
     if not direct:
         if not file_row["rd_link"]:
@@ -441,8 +466,7 @@ def download_rd_file_to_cache(file_row, direct=None, extension=None):
     fd, tmp_name = tempfile.mkstemp(prefix=f"{destination.name}.", suffix=".tmp", dir=str(destination.parent))
     try:
         with os.fdopen(fd, "wb") as tmp_file:
-            response = requests.get(direct, stream=True, timeout=60)
-            response.raise_for_status()
+            response = safe_streaming_get(direct, timeout=60)
             for chunk in response.iter_content(chunk_size=1024 * 1024):
                 if chunk:
                     tmp_file.write(chunk)
@@ -639,6 +663,106 @@ def playback_items_for_files(files):
                 }
             )
     return items
+
+
+def safe_path_component(value, fallback="item"):
+    cleaned = re.sub(r"[^A-Za-z0-9._ -]", "_", value or "").strip(" .")
+    return cleaned or fallback
+
+
+def ensure_child_path(parent, child):
+    parent_resolved = Path(parent).resolve()
+    child_resolved = Path(child).resolve()
+    if parent_resolved != child_resolved and parent_resolved not in child_resolved.parents:
+        raise ValueError("Unsafe destination path")
+    return child_resolved
+
+
+def atomic_copy_file(source, destination):
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f"{destination.name}.", suffix=".tmp", dir=str(destination.parent))
+    try:
+        with os.fdopen(fd, "wb") as tmp_file, open(source, "rb") as source_file:
+            shutil.copyfileobj(source_file, tmp_file, length=1024 * 1024)
+        Path(tmp_name).replace(destination)
+    except Exception:
+        try:
+            Path(tmp_name).unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def direct_download_url_for_file(file_row):
+    if not file_row["rd_link"]:
+        raise RealDebridError("No Real-Debrid link available yet; sync the book first.")
+    unrestricted = rd_client().unrestrict_link(file_row["rd_link"])
+    direct = unrestricted.get("download") or unrestricted.get("link")
+    if not direct:
+        raise RealDebridError("Real-Debrid did not return a downloadable direct link")
+    if not is_safe_stream_redirect_url(direct):
+        raise RealDebridError("Real-Debrid returned an unsafe stream URL")
+    return direct
+
+
+def download_direct_audio_to_path(file_row, destination):
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    direct = direct_download_url_for_file(file_row)
+    fd, tmp_name = tempfile.mkstemp(prefix=f"{destination.name}.", suffix=".tmp", dir=str(destination.parent))
+    try:
+        with os.fdopen(fd, "wb") as tmp_file:
+            response = safe_streaming_get(direct, timeout=60)
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    tmp_file.write(chunk)
+        Path(tmp_name).replace(destination)
+    except Exception:
+        try:
+            Path(tmp_name).unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def import_destination_for_book(book, import_dir):
+    root = Path(import_dir)
+    title = safe_path_component(book["title"], f"book-{book['id']}")
+    target = root / title
+    ensure_child_path(root, target)
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def sequence_destination(target_dir, sequence, name):
+    filename = safe_path_component(name, "audio")
+    destination = Path(target_dir) / f"{sequence:03d} - {filename}"
+    ensure_child_path(target_dir, destination)
+    return destination
+
+
+def import_book_audio_to_directory(book, files, target_dir):
+    imported = []
+    sequence = 1
+    for file_row in files:
+        if not archive_extension_from_name(file_row["filename"]) and not file_row["streamable"]:
+            continue
+        archive_path = resolved_archive_path(file_row)
+        if archive_path:
+            for entry in archive_audio_infos(archive_path):
+                source = extract_archive_entry_to_cache(archive_path, entry)
+                display_name = PurePosixPath(entry["name"].replace("\\", "/")).name or entry["name"]
+                destination = sequence_destination(target_dir, sequence, display_name)
+                atomic_copy_file(source, destination)
+                imported.append(destination.name)
+                sequence += 1
+        elif file_row["streamable"]:
+            destination = sequence_destination(target_dir, sequence, file_row["filename"])
+            download_direct_audio_to_path(file_row, destination)
+            imported.append(destination.name)
+            sequence += 1
+    return imported
 
 
 def row_to_dict(row):
@@ -922,6 +1046,56 @@ def api_audiobookshelf_scan():
     except Exception as e:
         print(f"[WARNING] Audiobookshelf scan failed: {e}")
         return jsonify({"message": sanitized_error(e)}), 502
+
+
+@app.route("/api/books/<int:book_id>/import-to-audiobookshelf", methods=["POST"])
+def api_import_book_to_audiobookshelf(book_id):
+    config = abs_config()
+    if not abs_is_configured(config) or not config["import_dir"]:
+        return jsonify({"message": "Audiobookshelf import is not configured"}), 400
+
+    book = get_book(book_id)
+    if not book:
+        abort(404)
+
+    maybe_auto_sync_book(book_id)
+    book = get_book(book_id)
+    if book["status"] != "downloaded" or int(book["progress"] or 0) < 100:
+        return jsonify({"message": "Book is not downloaded yet"}), 409
+
+    files = get_db().execute(
+        """
+        SELECT files.*, books.title AS book_title
+        FROM files
+        JOIN books ON books.id = files.book_id
+        WHERE files.book_id = ? AND files.selected = 1
+        ORDER BY files.rd_link_index
+        """,
+        (book_id,),
+    ).fetchall()
+
+    try:
+        target_dir = import_destination_for_book(book, config["import_dir"])
+        imported_files = import_book_audio_to_directory(book, files, target_dir)
+        if not imported_files:
+            return jsonify({"message": "No playable audio files to import"}), 409
+        abs_client().scan_library(config["library_id"], force=True)
+        return jsonify(
+            {
+                "message": "Imported to Audiobookshelf",
+                "book_id": book_id,
+                "library_id": config["library_id"],
+                "count": len(imported_files),
+                "imported_files": imported_files,
+            }
+        )
+    except Exception as e:
+        print(f"[WARNING] Audiobookshelf import failed for book {book_id}")
+        if isinstance(e, (RealDebridError, AudiobookshelfError)):
+            message = sanitized_error(e)
+        else:
+            message = "Import failed"
+        return jsonify({"message": message}), 502
 
 
 @app.route("/library")

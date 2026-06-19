@@ -78,11 +78,13 @@ Current implemented scope is intentionally small:
 
 - `GET /api/audiobookshelf/status` checks whether Audiobookshelf is configured and reachable.
 - `POST /api/audiobookshelf/scan` triggers a scan of the configured Audiobookshelf library.
-- No books are imported into Audiobookshelf yet.
+- `POST /api/books/<book_id>/import-to-audiobookshelf` materializes a completed Real-Debrid book into `AUDIOBOOKSHELF_IMPORT_DIR`, then triggers an Audiobookshelf scan.
 - Existing Flask playback routes remain unchanged.
-- No Audiobookshelf credentials are sent to the Android app.
+- No Real-Debrid or Audiobookshelf credentials are sent to the Android app.
 
-Next step: add an explicit import endpoint that takes a completed Real-Debrid book, materializes it into `AUDIOBOOKSHELF_IMPORT_DIR`, then triggers an Audiobookshelf scan.
+For Docker usage, `AUDIOBOOKSHELF_IMPORT_DIR` must point at a folder that is visible to both this Flask container and Audiobookshelf. The endpoint is intentionally explicit per book; it does not automatically migrate the whole library.
+
+Next step: wire the Android app button/status UI to call the import endpoint, then switch ready-book playback to Audiobookshelf once the imported item appears there.
 
 ## Tests
 
