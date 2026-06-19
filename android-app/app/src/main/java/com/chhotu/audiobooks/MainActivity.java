@@ -11,6 +11,7 @@ import android.os.Environment;
 import android.text.InputType;
 import android.view.Gravity;
 import android.view.View;
+import android.view.inputmethod.EditorInfo;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
@@ -38,6 +39,7 @@ public class MainActivity extends Activity {
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private LinearLayout content;
     private TextView status;
+    private TextView absStatus;
     private ProgressBar spinner;
     private EditText searchBox;
     private MediaPlayer player;
@@ -47,6 +49,7 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         buildLayout();
+        loadAudiobookshelfStatus();
         loadLibrary();
     }
 
@@ -69,10 +72,31 @@ public class MainActivity extends Activity {
         subtitle.setTextColor(0xff6b6761);
         root.addView(subtitle, new LinearLayout.LayoutParams(-1, -2));
 
+        absStatus = meta("Audiobookshelf: checking…");
+        root.addView(absStatus, new LinearLayout.LayoutParams(-1, -2));
+
+        LinearLayout absActions = new LinearLayout(this);
+        absActions.setOrientation(LinearLayout.HORIZONTAL);
+        Button absCheck = button("Check ABS");
+        absCheck.setOnClickListener(v -> loadAudiobookshelfStatus());
+        Button absScan = button("Scan ABS");
+        absScan.setOnClickListener(v -> scanAudiobookshelf());
+        absActions.addView(absCheck, new LinearLayout.LayoutParams(0, -2, 1));
+        absActions.addView(absScan, new LinearLayout.LayoutParams(0, -2, 1));
+        root.addView(absActions, new LinearLayout.LayoutParams(-1, -2));
+
         searchBox = new EditText(this);
         searchBox.setHint("Search audiobook title");
         searchBox.setSingleLine(true);
         searchBox.setInputType(InputType.TYPE_CLASS_TEXT);
+        searchBox.setImeOptions(EditorInfo.IME_ACTION_SEARCH);
+        searchBox.setOnEditorActionListener((v, actionId, event) -> {
+            if (actionId == EditorInfo.IME_ACTION_SEARCH) {
+                search();
+                return true;
+            }
+            return false;
+        });
         root.addView(searchBox, new LinearLayout.LayoutParams(-1, -2));
 
         LinearLayout actions = new LinearLayout(this);
@@ -127,6 +151,33 @@ public class MainActivity extends Activity {
         return v;
     }
 
+    private void loadAudiobookshelfStatus() {
+        getJson("/api/audiobookshelf/status", json -> runOnUiThread(() -> {
+            boolean configured = json.optBoolean("configured");
+            boolean reachable = json.optBoolean("reachable");
+            boolean authorized = json.optBoolean("authorized");
+            boolean libraryFound = json.optBoolean("library_found");
+            JSONObject library = json.optJSONObject("library");
+            if (configured && reachable && authorized && libraryFound) {
+                String name = library == null ? "ready" : library.optString("name", "ready");
+                absStatus.setText("Audiobookshelf: ready • " + name);
+            } else if (!configured) {
+                absStatus.setText("Audiobookshelf: not configured");
+            } else {
+                absStatus.setText("Audiobookshelf: needs attention");
+            }
+        }));
+    }
+
+    private void scanAudiobookshelf() {
+        setBusy("Scanning Audiobookshelf…");
+        postJson("/api/audiobookshelf/scan", "{\"force\":true}", json -> runOnUiThread(() -> {
+            Toast.makeText(this, json.optString("message", "Scan started"), Toast.LENGTH_LONG).show();
+            setStatus("Audiobookshelf scan started");
+            loadAudiobookshelfStatus();
+        }));
+    }
+
     private void loadLibrary() {
         setBusy("Loading library…");
         getJson("/api/library", json -> runOnUiThread(() -> {
@@ -165,7 +216,13 @@ public class MainActivity extends Activity {
     private void addSearchRow(JSONObject book) {
         if (book == null) return;
         content.addView(cardTitle(book.optString("title", "Untitled")));
-        content.addView(meta(book.optString("file_size", "") + "  " + book.optString("format", "")));
+        content.addView(meta(joinMeta(
+                book.optString("file_size", ""),
+                book.optString("format", ""),
+                book.optString("language", ""),
+                book.optString("bitrate", ""),
+                book.optString("post_date", "")
+        )));
         Button add = button("Add / prepare on server");
         add.setOnClickListener(v -> addBook(book));
         content.addView(add);
@@ -183,15 +240,28 @@ public class MainActivity extends Activity {
     private void addBookRow(JSONObject book) {
         if (book == null) return;
         int id = book.optInt("id");
+        String statusText = book.optString("status", "");
+        int progress = book.optInt("progress");
+        boolean readyForImport = "downloaded".equals(statusText) && progress >= 100;
+
         content.addView(cardTitle(book.optString("title", "Untitled")));
-        content.addView(meta(book.optString("status", "") + " • " + book.optInt("progress") + "% • " + book.optString("file_size", "")));
+        content.addView(meta(joinMeta(
+                statusText,
+                progress + "%",
+                book.optString("file_size", ""),
+                book.optString("format", "")
+        )));
+        String error = book.optString("error", "");
+        if (!error.isEmpty()) content.addView(meta("Error: " + error));
+
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         Button open = button("Open");
         open.setOnClickListener(v -> loadBook(id));
-        Button prepare = button("Prepare");
+        Button prepare = button("Refresh");
         prepare.setOnClickListener(v -> prepareBook(id));
-        Button importAbs = button("Import ABS");
+        Button importAbs = button(readyForImport ? "Import ABS" : "Wait");
+        importAbs.setEnabled(readyForImport);
         importAbs.setOnClickListener(v -> importToAudiobookshelf(id));
         row.addView(open, new LinearLayout.LayoutParams(0, -2, 1));
         row.addView(prepare, new LinearLayout.LayoutParams(0, -2, 1));
@@ -206,6 +276,7 @@ public class MainActivity extends Activity {
             Toast.makeText(this, json.optString("message", "Imported") + " (" + count + " files)", Toast.LENGTH_LONG).show();
             status.setText("Imported to Audiobookshelf: " + count + " files");
             setIdle();
+            loadAudiobookshelfStatus();
         }));
     }
 
@@ -224,9 +295,34 @@ public class MainActivity extends Activity {
             JSONObject book = json.optJSONObject("book");
             currentTitle = book == null ? "Audiobook" : book.optString("title", "Audiobook");
             status.setText(currentTitle);
-            Button importAbs = button("Import this book to Audiobookshelf");
+            boolean readyForImport = false;
+            if (book != null) {
+                String statusText = book.optString("status", "");
+                int progress = book.optInt("progress");
+                readyForImport = "downloaded".equals(statusText) && progress >= 100;
+                content.addView(meta(joinMeta(
+                        statusText,
+                        progress + "%",
+                        book.optString("file_size", "")
+                )));
+                String error = book.optString("error", "");
+                if (!error.isEmpty()) content.addView(meta("Error: " + error));
+            }
+
+            LinearLayout actions = new LinearLayout(this);
+            actions.setOrientation(LinearLayout.HORIZONTAL);
+            Button back = button("Library");
+            back.setOnClickListener(v -> loadLibrary());
+            Button prepare = button("Prepare / Refresh");
+            prepare.setOnClickListener(v -> prepareBook(id));
+            Button importAbs = button(readyForImport ? "Import ABS" : "Wait");
+            importAbs.setEnabled(readyForImport);
             importAbs.setOnClickListener(v -> importToAudiobookshelf(id));
-            content.addView(importAbs);
+            actions.addView(back, new LinearLayout.LayoutParams(0, -2, 1));
+            actions.addView(prepare, new LinearLayout.LayoutParams(0, -2, 1));
+            actions.addView(importAbs, new LinearLayout.LayoutParams(0, -2, 1));
+            content.addView(actions);
+
             JSONArray files = json.optJSONArray("files");
             if (files == null || files.length() == 0) {
                 content.addView(meta("No playable files yet. Tap Prepare or try again later."));
@@ -330,7 +426,7 @@ public class MainActivity extends Activity {
                 int code = conn.getResponseCode();
                 InputStream stream = code >= 400 ? conn.getErrorStream() : conn.getInputStream();
                 String text = readAll(stream);
-                if (code >= 400) throw new RuntimeException(text.isEmpty() ? ("HTTP " + code) : text);
+                if (code >= 400) throw new RuntimeException(errorMessage(text, code));
                 handler.handle(new JSONObject(text));
             } catch (Exception e) {
                 runOnUiThread(() -> {
@@ -342,6 +438,16 @@ public class MainActivity extends Activity {
                 if (conn != null) conn.disconnect();
             }
         });
+    }
+
+    private String errorMessage(String text, int code) {
+        if (text == null || text.isEmpty()) return "HTTP " + code;
+        try {
+            JSONObject json = new JSONObject(text);
+            String message = json.optString("message", "");
+            if (!message.isEmpty()) return message;
+        } catch (Exception ignored) {}
+        return text;
     }
 
     private String readAll(InputStream stream) throws Exception {
@@ -374,6 +480,16 @@ public class MainActivity extends Activity {
     private void setStatus(String text) {
         status.setText(text);
         spinner.setVisibility(View.GONE);
+    }
+
+    private String joinMeta(String... parts) {
+        StringBuilder sb = new StringBuilder();
+        for (String part : parts) {
+            if (part == null || part.trim().isEmpty()) continue;
+            if (sb.length() > 0) sb.append(" • ");
+            sb.append(part.trim());
+        }
+        return sb.toString();
     }
 
     private String safeName(String name) {
