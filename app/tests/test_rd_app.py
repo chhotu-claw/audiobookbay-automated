@@ -371,6 +371,34 @@ def test_stream_zip_entry_serves_audio_from_cached_archive(tmp_path, monkeypatch
     assert response.headers["Content-Type"].startswith("audio/mpeg")
 
 
+def test_stream_zip_entry_supports_range_requests_from_cached_audio(tmp_path, monkeypatch):
+    reset_db(tmp_path / "test.db")
+    app_module.app.config["ZIP_CACHE_DIR"] = str(tmp_path / "zip-cache")
+    app_module.app.config["RD_CLIENT_FACTORY"] = lambda: ZipRealDebrid()
+    zip_bytes = build_test_zip()
+    monkeypatch.setattr(app_module.requests, "get", lambda *args, **kwargs: FakeZipDownloadResponse(zip_bytes))
+    with app_module.app.app_context():
+        db = app_module.get_db()
+        db.execute(
+            "INSERT INTO books (title, abb_link, status, progress, added_at, updated_at, rd_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("A Lemon Tree", "https://audiobookbay.lu/book", "downloaded", 100, app_module.now_iso(), app_module.now_iso(), "rd-1"),
+        )
+        book_id = db.execute("SELECT id FROM books").fetchone()["id"]
+        db.execute(
+            "INSERT INTO files (book_id, rd_link_index, rd_link, filename, streamable, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (book_id, 0, "https://rd.example/zip-link", "A Lemon Tree.zip", 0, app_module.now_iso(), app_module.now_iso()),
+        )
+        file_id = db.execute("SELECT id FROM files").fetchone()["id"]
+        db.commit()
+
+    response = app_module.app.test_client().get(f"/stream-zip/{file_id}/0", headers={"Range": "bytes=0-2"})
+
+    assert response.status_code == 206
+    assert response.data == b"mp3"
+    assert response.headers["Accept-Ranges"] == "bytes"
+    assert response.headers["Content-Range"].startswith("bytes 0-2/")
+
+
 def test_m4b_archive_entries_are_served_as_audio_mp4():
     assert app_module.guess_audio_mimetype("Book.m4b") == "audio/mp4"
 

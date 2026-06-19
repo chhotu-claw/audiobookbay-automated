@@ -1,7 +1,9 @@
+import hashlib
 import mimetypes
 import os
 import re
 import ipaddress
+import shutil
 import sqlite3
 import socket
 import subprocess
@@ -14,7 +16,7 @@ from urllib.parse import quote, quote_plus, unquote, urlparse
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from flask import Flask, Response, abort, g, jsonify, redirect, render_template, request, url_for
+from flask import Flask, abort, g, jsonify, redirect, render_template, request, send_file, url_for
 
 load_dotenv()
 
@@ -835,45 +837,72 @@ def stream(file_id):
         abort(502, sanitized_error(e))
 
 
+def extracted_archive_dir(archive_path):
+    digest = hashlib.sha256(str(archive_path).encode("utf-8")).hexdigest()[:16]
+    directory = get_zip_cache_dir() / "extracted" / f"{archive_path.stem}-{digest}"
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def extracted_archive_entry_path(archive_path, entry):
+    name = entry["name"]
+    display_name = PurePosixPath(name.replace("\\", "/")).name or "audio"
+    safe_display_name = re.sub(r"[^A-Za-z0-9._ -]", "_", display_name).strip(" .") or "audio"
+    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:16]
+    return extracted_archive_dir(archive_path) / f"{digest}-{safe_display_name}"
+
+
+def extract_archive_entry_to_cache(archive_path, entry):
+    target = extracted_archive_entry_path(archive_path, entry)
+    expected_size = int(entry.get("size") or 0)
+    if target.exists() and target.stat().st_size > 0 and (not expected_size or target.stat().st_size == expected_size):
+        return target
+
+    fd, tmp_name = tempfile.mkstemp(prefix=f"{target.name}.", suffix=".tmp", dir=str(target.parent))
+    try:
+        with os.fdopen(fd, "wb") as tmp_file:
+            if zipfile.is_zipfile(archive_path) and entry.get("zip_info") is not None:
+                with zipfile.ZipFile(archive_path) as archive, archive.open(entry["zip_info"]) as source:
+                    shutil.copyfileobj(source, tmp_file, length=1024 * 1024)
+            else:
+                try:
+                    result = subprocess.run(
+                        [SEVEN_ZIP_BINARY, "x", "-so", str(archive_path), entry["name"]],
+                        stdout=tmp_file,
+                        stderr=subprocess.PIPE,
+                        timeout=900,
+                        check=False,
+                    )
+                except FileNotFoundError as exc:
+                    raise RealDebridError("Archive playback requires 7z to be installed on the server") from exc
+                if result.returncode != 0:
+                    stderr = result.stderr.decode(errors="ignore")[:500]
+                    print(f"[WARNING] 7z extraction failed for {archive_path}: {stderr}")
+                    raise RealDebridError("Archive audio extraction failed")
+        Path(tmp_name).replace(target)
+    except Exception:
+        try:
+            Path(tmp_name).unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+    return target
+
+
 def stream_archive_entry_response(archive_path, entry):
     name = entry["name"]
     mimetype = guess_audio_mimetype(name)
     display_name = PurePosixPath(name.replace("\\", "/")).name or "audio"
-
-    if zipfile.is_zipfile(archive_path) and entry.get("zip_info") is not None:
-        with zipfile.ZipFile(archive_path) as archive:
-            data = archive.read(entry["zip_info"])
-        response = Response(data, mimetype=mimetype)
-        response.headers["Content-Length"] = str(len(data))
-    else:
-        try:
-            process = subprocess.Popen(
-                [SEVEN_ZIP_BINARY, "x", "-so", str(archive_path), name],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-        except FileNotFoundError as exc:
-            raise RealDebridError("Archive playback requires 7z to be installed on the server") from exc
-
-        def generate():
-            try:
-                while True:
-                    chunk = process.stdout.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    yield chunk
-            finally:
-                stderr = process.stderr.read() if process.stderr else b""
-                return_code = process.wait()
-                if return_code != 0:
-                    print(f"[WARNING] 7z extraction failed for {archive_path}: {stderr.decode(errors='ignore')[:500]}")
-
-        response = Response(generate(), mimetype=mimetype)
-        if entry.get("size"):
-            response.headers["Content-Length"] = str(entry["size"])
-
-    response.headers["Content-Disposition"] = f"inline; filename*=UTF-8''{quote(display_name)}"
-    return response
+    extracted_path = extract_archive_entry_to_cache(archive_path, entry)
+    return send_file(
+        extracted_path,
+        mimetype=mimetype,
+        conditional=True,
+        as_attachment=False,
+        download_name=display_name,
+        max_age=0,
+    )
 
 
 @app.route("/stream-zip/<int:file_id>/<int:entry_index>")
