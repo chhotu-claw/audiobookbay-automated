@@ -399,6 +399,38 @@ def test_stream_zip_entry_supports_range_requests_from_cached_audio(tmp_path, mo
     assert response.headers["Content-Range"].startswith("bytes 0-2/")
 
 
+
+def test_api_book_expands_resolved_archive_link_even_when_db_filename_is_mp3(tmp_path, monkeypatch):
+    reset_db(tmp_path / "test.db")
+    app_module.app.config["ZIP_CACHE_DIR"] = str(tmp_path / "zip-cache")
+    app_module.app.config["RD_CLIENT_FACTORY"] = lambda: ArchiveStreamRealDebrid()
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("Book-Part05.mp3", b"part-five")
+        archive.writestr("Book-Part01.mp3", b"part-one")
+        archive.writestr("Book-Part02.mp3", b"part-two")
+    monkeypatch.setattr(app_module.requests, "get", lambda *args, **kwargs: FakeZipDownloadResponse(buffer.getvalue()))
+    with app_module.app.app_context():
+        db = app_module.get_db()
+        db.execute(
+            "INSERT INTO books (title, abb_link, status, progress, added_at, updated_at, rd_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("Book", "https://audiobookbay.lu/book", "downloaded", 100, app_module.now_iso(), app_module.now_iso(), "rd-1"),
+        )
+        book_id = db.execute("SELECT id FROM books").fetchone()["id"]
+        db.execute(
+            "INSERT INTO files (book_id, rd_link_index, rd_link, filename, streamable, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (book_id, 0, "https://rd.example/link-1", "Book-Part05.mp3", 1, app_module.now_iso(), app_module.now_iso()),
+        )
+        db.commit()
+
+    response = app_module.app.test_client().get(f"/api/books/{book_id}")
+
+    assert response.status_code == 200
+    filenames = [item["filename"] for item in response.json["files"]]
+    assert filenames == ["Book-Part01.mp3", "Book-Part02.mp3", "Book-Part05.mp3"]
+    assert [item["stream_url"] for item in response.json["files"]] == ["/stream-zip/1/0", "/stream-zip/1/1", "/stream-zip/1/2"]
+
+
 def test_m4b_archive_entries_are_served_as_audio_mp4():
     assert app_module.guess_audio_mimetype("Book.m4b") == "audio/mp4"
 

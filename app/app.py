@@ -483,14 +483,32 @@ def seven_zip_audio_infos(archive_path):
     return entries
 
 
+def natural_sort_key(value):
+    return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", value)]
+
+
 def archive_audio_infos(archive_path):
     if zipfile.is_zipfile(archive_path):
-        return safe_zip_audio_infos(archive_path)
-    return seven_zip_audio_infos(archive_path)
+        entries = safe_zip_audio_infos(archive_path)
+    else:
+        entries = seven_zip_audio_infos(archive_path)
+    return sorted(entries, key=lambda entry: natural_sort_key(entry["name"]))
 
 
-def archive_playback_items(file_row):
-    archive_path = ensure_archive_cached(file_row)
+def resolved_archive_path(file_row):
+    if archive_extension_from_name(file_row["filename"]):
+        return ensure_archive_cached(file_row)
+    if not file_row["rd_link"]:
+        return None
+    unrestricted = rd_client().unrestrict_link(file_row["rd_link"])
+    direct = unrestricted.get("download") or unrestricted.get("link")
+    if direct and is_safe_stream_redirect_url(direct) and is_archive_url(direct):
+        return ensure_archive_cached(file_row, direct=direct, extension=archive_extension_from_name(direct))
+    return None
+
+
+def archive_playback_items(file_row, archive_path=None):
+    archive_path = archive_path or ensure_archive_cached(file_row)
     items = []
     for index, info in enumerate(archive_audio_infos(archive_path)):
         display_name = PurePosixPath(info["name"].replace("\\", "/")).name or info["name"]
@@ -513,7 +531,15 @@ def zip_playback_items(file_row):
 def playback_items_for_files(files):
     items = []
     for file_row in files:
-        if file_row["streamable"]:
+        try:
+            archive_path = resolved_archive_path(file_row)
+        except Exception as e:
+            print(f"[WARNING] Archive inspection failed for file {file_row['id']}: {e}")
+            archive_path = None
+
+        if archive_path:
+            items.extend(archive_playback_items(file_row, archive_path=archive_path))
+        elif file_row["streamable"]:
             items.append(
                 {
                     "filename": file_row["filename"],
@@ -524,19 +550,15 @@ def playback_items_for_files(files):
                 }
             )
         elif archive_extension_from_name(file_row["filename"]):
-            try:
-                items.extend(archive_playback_items(file_row))
-            except Exception as e:
-                print(f"[WARNING] Archive inspection failed for file {file_row['id']}: {e}")
-                items.append(
-                    {
-                        "filename": file_row["filename"],
-                        "bytes": file_row["bytes"],
-                        "streamable": False,
-                        "stream_url": None,
-                        "note": "Archive could not be inspected yet.",
-                    }
-                )
+            items.append(
+                {
+                    "filename": file_row["filename"],
+                    "bytes": file_row["bytes"],
+                    "streamable": False,
+                    "stream_url": None,
+                    "note": "Archive could not be inspected yet.",
+                }
+            )
         else:
             items.append(
                 {
@@ -908,10 +930,12 @@ def stream_archive_entry_response(archive_path, entry):
 @app.route("/stream-zip/<int:file_id>/<int:entry_index>")
 def stream_zip_entry(file_id, entry_index):
     file_row = get_db().execute("SELECT files.*, books.title AS book_title FROM files JOIN books ON books.id = files.book_id WHERE files.id = ?", (file_id,)).fetchone()
-    if not file_row or not archive_extension_from_name(file_row["filename"]):
+    if not file_row:
         abort(404)
     try:
-        archive_path = ensure_archive_cached(file_row)
+        archive_path = resolved_archive_path(file_row)
+        if not archive_path:
+            abort(404)
         entries = archive_audio_infos(archive_path)
         if entry_index < 0 or entry_index >= len(entries):
             abort(404)
