@@ -191,9 +191,22 @@ public class MainActivity extends Activity {
         open.setOnClickListener(v -> loadBook(id));
         Button prepare = button("Prepare");
         prepare.setOnClickListener(v -> prepareBook(id));
+        Button importAbs = button("Import ABS");
+        importAbs.setOnClickListener(v -> importToAudiobookshelf(id));
         row.addView(open, new LinearLayout.LayoutParams(0, -2, 1));
         row.addView(prepare, new LinearLayout.LayoutParams(0, -2, 1));
+        row.addView(importAbs, new LinearLayout.LayoutParams(0, -2, 1));
         content.addView(row);
+    }
+
+    private void importToAudiobookshelf(int id) {
+        setBusy("Importing to Audiobookshelf…");
+        postJson("/api/books/" + id + "/import-to-audiobookshelf", "{}", json -> runOnUiThread(() -> {
+            int count = json.optInt("count", 0);
+            Toast.makeText(this, json.optString("message", "Imported") + " (" + count + " files)", Toast.LENGTH_LONG).show();
+            status.setText("Imported to Audiobookshelf: " + count + " files");
+            setIdle();
+        }));
     }
 
     private void prepareBook(int id) {
@@ -211,6 +224,9 @@ public class MainActivity extends Activity {
             JSONObject book = json.optJSONObject("book");
             currentTitle = book == null ? "Audiobook" : book.optString("title", "Audiobook");
             status.setText(currentTitle);
+            Button importAbs = button("Import this book to Audiobookshelf");
+            importAbs.setOnClickListener(v -> importToAudiobookshelf(id));
+            content.addView(importAbs);
             JSONArray files = json.optJSONArray("files");
             if (files == null || files.length() == 0) {
                 content.addView(meta("No playable files yet. Tap Prepare or try again later."));

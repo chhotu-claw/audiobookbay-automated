@@ -61,30 +61,40 @@ Open http://localhost:5078.
 
 ## Notes
 
-- This app does not run a torrent client and does not store downloaded audiobook files.
+- This app does not run a torrent client; Real-Debrid handles torrent resolution server-side.
 - Real-Debrid direct links are generated on demand by `/stream/<file_id>` and returned as redirects.
+- Docker Compose also runs stock Audiobookshelf on http://localhost:13378 when enabled with the default compose file.
 - AudioBookBay scraping can break if the site changes its markup or blocks requests.
 
 ## Audiobookshelf integration status
 
-This repo now has a minimal server-side Audiobookshelf scaffold for the planned one-app architecture:
+This repo now runs stock Audiobookshelf behind the Flask sidecar:
 
 ```text
-Android app -> Flask sidecar for search/download/jobs
-Android app -> Audiobookshelf API later for library/playback/progress
+Android app -> Flask sidecar for search/download/import jobs
+Flask sidecar -> Real-Debrid server-side acquisition
+Flask sidecar -> shared Audiobookshelf library folder
+Audiobookshelf -> library scanning, grouping, metadata, playback clients
 ```
 
-Current implemented scope is intentionally small:
+Current implemented scope:
 
 - `GET /api/audiobookshelf/status` checks whether Audiobookshelf is configured and reachable.
 - `POST /api/audiobookshelf/scan` triggers a scan of the configured Audiobookshelf library.
 - `POST /api/books/<book_id>/import-to-audiobookshelf` materializes a completed Real-Debrid book into `AUDIOBOOKSHELF_IMPORT_DIR`, then triggers an Audiobookshelf scan.
+- Android debug APK includes an **Import ABS** / **Import this book to Audiobookshelf** action that calls the import endpoint.
 - Existing Flask playback routes remain unchanged.
 - No Real-Debrid or Audiobookshelf credentials are sent to the Android app.
 
-For Docker usage, `AUDIOBOOKSHELF_IMPORT_DIR` must point at a folder that is visible to both this Flask container and Audiobookshelf. The endpoint is intentionally explicit per book; it does not automatically migrate the whole library.
+Docker path mapping:
 
-Next step: wire the Android app button/status UI to call the import endpoint, then switch ready-book playback to Audiobookshelf once the imported item appears there.
+- Flask writes imports to `/abs-import`.
+- Audiobookshelf scans `/audiobooks`.
+- Both are backed by host `./data/abs-audiobooks`.
+
+Audiobookshelf stores its config under ignored `./abs/config` and metadata under ignored `./abs/metadata`. Local secrets/API tokens live in ignored `.env`.
+
+Remaining future improvement: switch ready-book playback inside the custom Android app to Audiobookshelf's playback/progress APIs. Until then, the custom app handles search/import and Audiobookshelf handles final library/playback.
 
 ## Tests
 

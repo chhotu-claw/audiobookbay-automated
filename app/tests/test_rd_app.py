@@ -127,8 +127,10 @@ def reset_db(db_path):
     app_module.app.config.pop("RD_CLIENT_FACTORY", None)
     app_module.app.config.pop("ZIP_CACHE_DIR", None)
     app_module.app.config.pop("ABS_CLIENT_FACTORY", None)
-    for key in ("AUDIOBOOKSHELF_URL", "AUDIOBOOKSHELF_API_TOKEN", "AUDIOBOOKSHELF_LIBRARY_ID", "AUDIOBOOKSHELF_IMPORT_DIR"):
-        app_module.app.config.pop(key, None)
+    app_module.app.config["AUDIOBOOKSHELF_URL"] = ""
+    app_module.app.config["AUDIOBOOKSHELF_API_TOKEN"] = ""
+    app_module.app.config["AUDIOBOOKSHELF_LIBRARY_ID"] = ""
+    app_module.app.config["AUDIOBOOKSHELF_IMPORT_DIR"] = ""
 
     app_module.app.config["DATABASE_PATH"] = str(db_path)
     with app_module.app.app_context():

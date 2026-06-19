@@ -67,6 +67,7 @@ instance/
 
 # Local app data
 /data/
+/abs/
 
 # Android local build state
 android-app/.gradle/
